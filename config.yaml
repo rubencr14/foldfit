@@ -1,0 +1,48 @@
+model:
+  weights_path: /home/rubencr/.molfun/weights/openfold/finetuning_ptm_2.pt
+  head: structure
+  head_config: {}
+  device: cuda
+
+data:
+  sabdab_dir: ./data/sabdab
+  pdb_paths: []
+  max_seq_len: 256
+  max_structures: 200
+  val_frac: 0.1
+  test_frac: 0.1
+  split_seed: 42
+  resolution_max: 3.0
+
+training:
+  epochs: 20
+  learning_rate: 5.0e-5
+  lr_lora: 5.0e-5
+  lr_head: 5.0e-4
+  batch_size: 1
+  weight_decay: 0.01
+  warmup_steps: 100
+  scheduler: cosine
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  accumulation_steps: 4
+  amp: true
+  early_stopping_patience: 5
+  ema_decay: 0.0
+  gradient_checkpointing: true
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.0
+  target_modules:
+    - linear_q
+    - linear_v
+
+msa:
+  backend: single
+  msa_dir: null
+  max_msa_depth: 512
+
+output:
+  checkpoint_dir: ./checkpoints
