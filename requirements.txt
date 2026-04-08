@@ -1,0 +1,14 @@
+# Core
+torch>=2.0
+pydantic>=2.0
+fastapi>=0.100
+uvicorn>=0.23
+pyyaml>=6.0
+typer>=0.12
+httpx>=0.24
+ml-collections>=0.1.1
+biopython>=1.81
+
+# OpenFold (install from source)
+# git clone https://github.com/aqlaboratory/openfold.git
+# cd openfold && pip install -e .
