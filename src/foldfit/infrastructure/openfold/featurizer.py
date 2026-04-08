@@ -201,8 +201,8 @@ class OpenFoldFeaturizer:
                 protein["msa"], dtype=torch.float32
             )
 
-        # 6. Build msa_feat and target_feat
-        dt.make_msa_feat(protein)
+        # 6. Build msa_feat and target_feat (curried — call with () first)
+        dt.make_msa_feat()(protein)
 
         # Template placeholders
         self._add_template_placeholders(protein, L)
