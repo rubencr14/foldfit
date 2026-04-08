@@ -88,18 +88,18 @@ msa:
 
 Multiple databases are searched in order and results merged into a single MSA.
 
-MSAs can be pre-generated with the batch script:
+MSAs can be pre-generated via the CLI:
 
 ```bash
 # With ColabFold public API
-python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa
 
 # With local MMseqs2 + OAS
-python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa \
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa \
     --backend local --database /data/oas/oas_db --database /data/uniref30/uniref30
 
 # With self-hosted ColabFold server
-python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa \
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa \
     --backend colabfold --colabfold-server http://my-server:8080
 ```
 
@@ -137,12 +137,24 @@ The `InferenceService` loads the base OpenFold model and optionally applies a sa
 | `/v1/msa` | POST | Compute MSA for a sequence |
 | `/health` | GET | Health check |
 
-**Typer CLI**:
+**Typer CLI** with five commands:
 
 ```bash
+# Fine-tune
 python scripts/finetune.py finetune --config config.yaml
-python scripts/finetune.py predict EVQLVESGG... --adapter-path ./checkpoints/final/peft
-python scripts/finetune.py msa EVQLVESGG... --backend colabfold
+
+# Predict structure (outputs PDB to stdout or file)
+python scripts/finetune.py predict EVQLVESGG... --adapter-path ./checkpoints/final/peft -o pred.pdb
+
+# Evaluate on ground-truth structures (CA-RMSD, GDT-TS, pLDDT)
+python scripts/finetune.py evaluate data/sabdab --adapter-path ./checkpoints/final/peft
+
+# Compute MSA for a single sequence
+python scripts/finetune.py msa EVQLVESGG... --backend colabfold -o query.msa.pt
+
+# Batch-generate MSAs for training data
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa \
+    --backend local --database /data/oas/oas_db
 ```
 
 ---
