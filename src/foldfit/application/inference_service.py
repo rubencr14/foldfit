@@ -102,7 +102,7 @@ class InferenceService:
         from foldfit.infrastructure.openfold.pdb_writer import coords_to_pdb
 
         # Featurize
-        featurizer = OpenFoldFeaturizer(max_seq_len=max_seq_len)
+        featurizer = OpenFoldFeaturizer(max_seq_len=max_seq_len, training=False)
         features = featurizer.from_sequence(sequence)
 
         if not features:

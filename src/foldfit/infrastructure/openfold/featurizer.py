@@ -37,11 +37,15 @@ class OpenFoldFeaturizer:
         num_msa: int = 512,
         num_extra_msa: int = 1024,
         num_templates: int = 4,
+        masked_msa_replace_fraction: float = 0.15,
+        training: bool = True,
     ) -> None:
         self.max_seq_len = max_seq_len
         self.num_msa = num_msa
         self.num_extra_msa = num_extra_msa
         self.num_templates = num_templates
+        self.masked_msa_replace_fraction = masked_msa_replace_fraction
+        self.training = training
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -140,7 +144,13 @@ class OpenFoldFeaturizer:
         msa_data: dict[str, torch.Tensor] | None,
         msa_path: str | Path | None,
     ) -> dict[str, torch.Tensor]:
-        """Build the complete feature dict from raw arrays."""
+        """Build the complete feature dict from raw arrays.
+
+        Uses OpenFold's native data transforms for the full MSA pipeline:
+        raw MSA → masks → HHblits profile → sample → BERT masking → msa_feat.
+        """
+        import ml_collections
+
         # Base protein features
         protein: dict[str, Any] = {
             "aatype": torch.tensor(aatype, dtype=torch.long),
@@ -159,10 +169,39 @@ class OpenFoldFeaturizer:
         dt.get_chi_angles(protein)
         dt.make_pseudo_beta("")(protein)
 
-        # MSA tensors
+        # ── MSA pipeline (OpenFold native) ────────────────────────────────
+        # 1. Raw MSA tensors
         self._add_msa_tensors(protein, seq, L, msa_data, msa_path)
 
-        # Build msa_feat and target_feat via OpenFold's make_msa_feat
+        # 2. Standard masks
+        dt.make_msa_mask(protein)
+
+        # 3. HHblits profile (mean of one-hot MSA — needed for masked MSA)
+        dt.make_hhblits_profile(protein)
+
+        # 4. Sample MSA + separate extra sequences
+        dt.sample_msa(self.num_msa, keep_extra=True)(protein)
+        dt.crop_extra_msa(self.num_extra_msa)(protein)
+
+        # 5. BERT-style masking for masked MSA loss (training only)
+        if self.training:
+            masked_msa_config = ml_collections.ConfigDict({
+                "uniform_prob": 0.1,
+                "profile_prob": 0.1,
+                "same_prob": 0.1,
+            })
+            dt.make_masked_msa(
+                masked_msa_config,
+                self.masked_msa_replace_fraction,
+                seed=None,
+            )(protein)
+        else:
+            protein["true_msa"] = protein["msa"].clone()
+            protein["bert_mask"] = torch.zeros_like(
+                protein["msa"], dtype=torch.float32
+            )
+
+        # 6. Build msa_feat and target_feat
         dt.make_msa_feat(protein)
 
         # Template placeholders
@@ -170,7 +209,7 @@ class OpenFoldFeaturizer:
 
         # Metadata
         protein["seq_length"] = torch.tensor([L], dtype=torch.int64)
-        protein["seq_mask"] = torch.ones(L, dtype=torch.float32)
+        dt.make_seq_mask(protein)
 
         # Recycling dimension
         return self._add_recycling_dim(protein)
@@ -187,31 +226,21 @@ class OpenFoldFeaturizer:
     ) -> None:
         """Populate raw MSA tensors into the protein dict.
 
-        After this, make_msa_feat() will build msa_feat from them.
+        Only sets msa + deletion_matrix. The rest (masks, sampling,
+        BERT masking, extra_msa) is handled by the native pipeline.
         """
         if msa_data is not None:
-            msa_t = msa_data["msa"][:self.num_msa, :L]
-            del_t = msa_data["deletion_matrix"][:self.num_msa, :L]
+            protein["msa"] = msa_data["msa"][:, :L]
+            protein["deletion_matrix"] = msa_data["deletion_matrix"][:, :L]
         elif msa_path is not None:
-            msa_seqs = self._parse_a3m(Path(msa_path))[:self.num_msa]
+            msa_seqs = self._parse_a3m(Path(msa_path))
             msa_t, del_t = self._encode_msa_seqs(msa_seqs, L)
+            protein["msa"] = msa_t
+            protein["deletion_matrix"] = del_t
         else:
-            # Single-sequence MSA
             encoded = [rc.restype_order.get(aa, rc.restype_num) for aa in seq[:L]]
-            msa_t = torch.tensor([encoded], dtype=torch.long)
-            del_t = torch.zeros(1, L, dtype=torch.float32)
-
-        N = msa_t.shape[0]
-        extra_N = min(N, self.num_extra_msa)
-
-        protein["msa"] = msa_t
-        protein["deletion_matrix"] = del_t
-        protein["msa_mask"] = torch.ones(N, L, dtype=torch.float32)
-        protein["true_msa"] = msa_t.clone()
-        protein["bert_mask"] = torch.ones(N, L, dtype=torch.float32)
-        protein["extra_msa"] = msa_t[:extra_N]
-        protein["extra_msa_mask"] = torch.ones(extra_N, L, dtype=torch.float32)
-        protein["extra_deletion_matrix"] = del_t[:extra_N]
+            protein["msa"] = torch.tensor([encoded], dtype=torch.long)
+            protein["deletion_matrix"] = torch.zeros(1, L, dtype=torch.float32)
 
     def _encode_msa_seqs(
         self, msa_seqs: list[str], L: int

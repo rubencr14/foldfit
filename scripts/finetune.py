@@ -224,7 +224,7 @@ def evaluate(
     typer.echo("Loading model...")
     service.load(model_config=model_config, adapter_path=adapter_path)
 
-    featurizer = OpenFoldFeaturizer(max_seq_len=max_seq_len)
+    featurizer = OpenFoldFeaturizer(max_seq_len=max_seq_len, training=False)
     pdb_paths = sorted(
         list(Path(pdb_dir).glob("*.pdb"))
         + list(Path(pdb_dir).glob("*.cif"))

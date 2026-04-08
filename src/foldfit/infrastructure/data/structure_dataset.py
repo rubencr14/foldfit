@@ -143,6 +143,7 @@ def _pad_to_length(tensor: torch.Tensor, target_len: int, key: str) -> torch.Ten
         "msa", "deletion_matrix", "msa_mask", "msa_feat", "true_msa", "bert_mask",
         "extra_msa", "extra_msa_mask", "extra_has_deletion",
         "extra_deletion_value", "extra_msa_deletion_value",
+        "extra_deletion_matrix",
     }
 
     current_len = tensor.shape[0]
