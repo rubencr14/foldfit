@@ -137,10 +137,17 @@ The `InferenceService` loads the base OpenFold model and optionally applies a sa
 | `/v1/msa` | POST | Compute MSA for a sequence |
 | `/health` | GET | Health check |
 
-**Typer CLI** with five commands:
+**Typer CLI** with six commands:
 
 ```bash
-# Fine-tune
+# Download antibody structures from SAbDab/RCSB
+python scripts/finetune.py download -n 200 -r 2.5 -t nanobody
+
+# Generate MSAs for downloaded structures
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa \
+    --backend local --database /data/oas/oas_db
+
+# Run fine-tuning
 python scripts/finetune.py finetune --config config.yaml
 
 # Predict structure (outputs PDB to stdout or file)
@@ -151,10 +158,6 @@ python scripts/finetune.py evaluate data/sabdab --adapter-path ./checkpoints/fin
 
 # Compute MSA for a single sequence
 python scripts/finetune.py msa EVQLVESGG... --backend colabfold -o query.msa.pt
-
-# Batch-generate MSAs for training data
-python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa \
-    --backend local --database /data/oas/oas_db
 ```
 
 ---
@@ -220,15 +223,18 @@ pip install -e ".[dev]"
 ### Fine-tune
 
 ```bash
-# 1. Generate MSAs (optional but recommended)
-python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa --backend colabfold
+# 1. Download antibody structures
+python scripts/finetune.py download -n 200 -r 3.0
 
-# 2. Update config.yaml to point MSA to precomputed
+# 2. Generate MSAs (optional but recommended)
+python scripts/finetune.py generate-msa --pdb-dir data/sabdab --output-dir data/msa
+
+# 3. Update config.yaml to point MSA to precomputed
 #    msa:
 #      backend: precomputed
 #      msa_dir: ./data/msa
 
-# 3. Run fine-tuning
+# 4. Run fine-tuning
 python scripts/finetune.py finetune --config config.yaml
 ```
 

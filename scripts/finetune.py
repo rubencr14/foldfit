@@ -1,6 +1,7 @@
 """Foldfit CLI: fine-tune OpenFold on antibody structures.
 
 Commands:
+    download      Download antibody structures from SAbDab/RCSB
     finetune      Run LoRA fine-tuning
     predict       Predict structure from sequence
     evaluate      Evaluate model on a set of PDB structures
@@ -28,6 +29,88 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("foldfit.cli")
+
+
+# ── download ──────────────────────────────────────────────────────────────
+
+@app.command()
+def download(
+    output_dir: Path = typer.Option("./data/sabdab", "-o", "--output-dir", help="Output directory"),
+    max_structures: int = typer.Option(200, "-n", "--max", help="Maximum structures to download"),
+    resolution: float = typer.Option(3.0, "-r", "--resolution", help="Max resolution in angstroms"),
+    antibody_type: str = typer.Option(
+        "all", "-t", "--type",
+        help="Type filter: all / antibody / nanobody / Fab / scFv / immunoglobulin",
+    ),
+    organism: Optional[str] = typer.Option(None, help="Organism filter (e.g. 'Homo sapiens')"),
+    method: Optional[str] = typer.Option(None, help="Method filter (e.g. 'X-RAY DIFFRACTION')"),
+    skip_existing: bool = typer.Option(True, help="Skip PDBs already downloaded"),
+) -> None:
+    """Download antibody structures from SAbDab/RCSB PDB.
+
+    Queries RCSB for antibody structures (with SAbDab fallback),
+    filters by resolution/type/organism, and downloads PDB files.
+
+    Examples:
+        # Download 200 antibodies at <=3A resolution
+        foldfit download -n 200
+
+        # Only human nanobodies at high resolution
+        foldfit download -n 100 -r 2.0 -t nanobody --organism "Homo sapiens"
+
+        # Only X-ray structures
+        foldfit download --method "X-RAY DIFFRACTION"
+    """
+    from foldfit.infrastructure.data.sabdab_repository import SabdabRepository
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    repo = SabdabRepository(cache_dir=output_dir)
+
+    # Check existing
+    existing = list(output_dir.glob("*.pdb"))
+    if skip_existing and existing:
+        typer.echo(f"Found {len(existing)} existing PDBs in {output_dir}")
+
+    # Query PDB IDs
+    typer.echo(f"Querying RCSB for antibody structures (resolution<={resolution}A, type={antibody_type})...")
+    pdb_ids = repo.query_antibody_pdb_ids(
+        resolution_max=resolution,
+        max_results=max_structures,
+        antibody_type=antibody_type,
+        organism=organism or "",
+        method=method or "",
+    )
+
+    if not pdb_ids:
+        typer.echo("No structures found matching the filters.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Found {len(pdb_ids)} PDB IDs. Downloading...")
+
+    success = 0
+    skipped = 0
+    failed = 0
+
+    for i, pdb_id in enumerate(pdb_ids):
+        dest = output_dir / f"{pdb_id}.pdb"
+
+        if skip_existing and dest.exists():
+            skipped += 1
+            continue
+
+        ok = repo.download_pdb(pdb_id, dest)
+        if ok:
+            success += 1
+            if (success % 20 == 0) or (i == len(pdb_ids) - 1):
+                typer.echo(f"  [{i+1}/{len(pdb_ids)}] Downloaded {success} so far...")
+        else:
+            failed += 1
+
+    total = success + skipped
+    typer.echo(
+        f"Done: {total} structures in {output_dir} "
+        f"({success} new, {skipped} existing, {failed} failed)"
+    )
 
 
 # ── finetune ──────────────────────────────────────────────────────────────
