@@ -28,8 +28,8 @@ htmlcov/
 .mypy_cache/
 
 # Data and checkpoints
-data/
-checkpoints/
+/data/
+/checkpoints/
 *.pt
 *.pth
 !config.yaml

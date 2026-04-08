@@ -141,10 +141,15 @@ class Trainer:
 
             # Validate
             if val_loader is not None:
-                val_loss = self._val_epoch(
+                val_results = self._val_epoch(
                     model, loss_fn, val_loader, device, ema, model_forward_fn
                 )
+                val_loss = val_results.get("loss", 0.0)
                 metrics["val_loss"] = val_loss
+                # Include auxiliary metrics (ca_rmsd, gdt_ts, plddt, etc.)
+                for k, v in val_results.items():
+                    if k != "loss":
+                        metrics[f"val_{k}"] = v
 
                 improved = val_loss < best_val_loss
                 if improved:
@@ -167,10 +172,16 @@ class Trainer:
                     break
 
             history.append(metrics)
-            logger.info(
-                f"Epoch {epoch}: train_loss={train_loss:.6f}"
-                + (f" val_loss={metrics.get('val_loss', 0):.6f}" if val_loader else "")
-            )
+            parts = [f"Epoch {epoch}: train_loss={train_loss:.6f}"]
+            if val_loader:
+                parts.append(f"val_loss={metrics.get('val_loss', 0):.6f}")
+                if "val_ca_rmsd" in metrics:
+                    parts.append(f"RMSD={metrics['val_ca_rmsd']:.3f}Å")
+                if "val_gdt_ts" in metrics:
+                    parts.append(f"GDT-TS={metrics['val_gdt_ts']:.3f}")
+                if "val_plddt" in metrics:
+                    parts.append(f"pLDDT={metrics['val_plddt']:.1f}")
+            logger.info(" | ".join(parts))
 
         return history
 
@@ -258,11 +269,12 @@ class Trainer:
         device: torch.device | str,
         ema: EMA | None,
         model_forward_fn: Any = None,
-    ) -> float:
+    ) -> dict[str, float]:
+        """Run validation and return loss + all metrics."""
         model.eval()
         originals = ema.apply() if ema else None
 
-        total_loss = 0.0
+        totals: dict[str, float] = {}
         num_batches = 0
 
         for batch in loader:
@@ -280,13 +292,16 @@ class Trainer:
                 preds = model(batch)
                 loss_dict = loss_fn(preds, batch)
 
-            total_loss += loss_dict["loss"].item()
+            for k, v in loss_dict.items():
+                val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                totals[k] = totals.get(k, 0.0) + val
             num_batches += 1
 
         if ema and originals is not None:
             ema.restore(originals)
 
-        return total_loss / max(num_batches, 1)
+        n = max(num_batches, 1)
+        return {k: v / n for k, v in totals.items()}
 
     def _save_checkpoint(
         self,

@@ -71,11 +71,39 @@ class DataConfig(BaseModel, frozen=True):
 
 
 class MsaConfig(BaseModel, frozen=True):
-    """MSA computation configuration."""
+    """MSA computation configuration.
 
-    backend: Literal["precomputed", "colabfold", "single"] = "single"
+    Backends:
+        single: Dummy MSA with query sequence only (no external deps).
+        precomputed: Load .a3m files from msa_dir.
+        colabfold: Query ColabFold MMseqs2 server (public or self-hosted).
+        local: Run MMseqs2/HHblits locally against custom databases (e.g. OAS).
+    """
+
+    backend: Literal["precomputed", "colabfold", "local", "single"] = "single"
     msa_dir: str | None = Field(default=None, description="Directory for precomputed .a3m files")
     max_msa_depth: int = Field(default=512, ge=1)
+
+    # ColabFold server (public API or self-hosted)
+    colabfold_server: str = Field(
+        default="https://api.colabfold.com",
+        description="ColabFold server URL. Use your own for no rate limits.",
+    )
+
+    # Local MSA tool config
+    tool: Literal["mmseqs2", "hhblits", "jackhmmer"] = Field(
+        default="mmseqs2",
+        description="Local alignment tool (used when backend=local).",
+    )
+    tool_binary: str | None = Field(
+        default=None,
+        description="Path to tool binary. Auto-detected from PATH if null.",
+    )
+    database_paths: list[str] = Field(
+        default_factory=list,
+        description="Paths to sequence databases (e.g. OAS, UniRef30). Searched in order.",
+    )
+    n_cpu: int = Field(default=4, ge=1, description="CPUs for local alignment.")
 
 
 class ModelConfig(BaseModel, frozen=True):

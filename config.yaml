@@ -40,9 +40,20 @@ lora:
     - linear_v
 
 msa:
-  backend: single
-  msa_dir: null
+  backend: single                # single / precomputed / colabfold / local
+  msa_dir: null                  # Directory for precomputed .a3m files
   max_msa_depth: 512
+
+  # ColabFold server (public or self-hosted)
+  colabfold_server: "https://api.colabfold.com"
+
+  # Local alignment (backend: local)
+  tool: mmseqs2                  # mmseqs2 / hhblits / jackhmmer
+  tool_binary: null              # auto-detect from PATH if null
+  database_paths:                # searched in order, results merged
+    # - /data/oas/oas_db        # OAS for antibodies
+    # - /data/uniref30/uniref30 # UniRef30 for general proteins
+  n_cpu: 4
 
 output:
   checkpoint_dir: ./checkpoints

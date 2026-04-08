@@ -1,8 +1,8 @@
 # Foldfit
 
-Parameter-efficient fine-tuning of OpenFold on antibody structures using LoRA and QLoRA, built in pure PyTorch.
+Parameter-efficient fine-tuning of OpenFold on antibody structures using LoRA, built with PyTorch and OpenFold's native modules.
 
-Foldfit provides a clean, self-contained framework to adapt OpenFold's protein structure prediction model specifically for antibodies. It downloads curated antibody structures from [SAbDab](https://opig.stats.ox.ac.uk/webapps/sabdab-sabpred/sabdab/), injects low-rank adapters (LoRA) into the Evoformer attention layers, and fine-tunes with a full training loop that supports mixed precision, gradient accumulation, early stopping, and more.
+Foldfit adapts OpenFold's protein structure prediction model specifically for antibodies. It downloads curated antibody structures from [SAbDab](https://opig.stats.ox.ac.uk/webapps/sabdab-sabpred/sabdab/), injects low-rank adapters (LoRA) into the Evoformer attention layers, and fine-tunes with the full AlphaFold2 loss formulation (FAPE + distogram + masked MSA + supervised chi + pLDDT). MSA computation supports local tools with custom databases like [OAS](http://opig.stats.ox.ac.uk/webapps/oas/) for deep antibody-specific alignments.
 
 ---
 
@@ -10,68 +10,112 @@ Foldfit provides a clean, self-contained framework to adapt OpenFold's protein s
 
 ### 1. LoRA Injection (Parameter-Efficient Fine-Tuning)
 
-Instead of updating all ~93M parameters of OpenFold, Foldfit freezes the entire base model and injects small trainable adapters into specific linear layers. This is the LoRA (Low-Rank Adaptation) technique:
+Instead of updating all ~93M parameters of OpenFold, Foldfit freezes the entire base model and injects small trainable adapters into specific linear layers:
 
 - For each target layer (by default `linear_q` and `linear_v` in the Evoformer attention), the original `nn.Linear` is replaced with a `LoRALinear` module.
 - `LoRALinear` keeps the original frozen weight `W` and adds two small trainable matrices:
   - `lora_A` with shape `[rank, in_features]` (initialized with Kaiming uniform)
   - `lora_B` with shape `[out_features, rank]` (initialized to zero)
 - The forward pass computes: **y = W @ x + (alpha / rank) * B @ A @ x**
-- Since `B` starts at zero, the model initially behaves identically to the original.
-- Only `lora_A` and `lora_B` are trainable (~600K parameters for rank=8), making fine-tuning feasible on a single GPU with 12GB VRAM.
+- Only `lora_A` and `lora_B` are trainable (~600K parameters for rank=8), making fine-tuning feasible on a single GPU.
 
-For **QLoRA**, the frozen base weights are additionally quantized to 4-bit (NF4) using bitsandbytes before injecting LoRA adapters, reducing memory usage even further.
+After training, LoRA weights can be **merged** into the base weights for zero-overhead inference, or kept separate for adapter swapping.
 
-After training, LoRA weights can be **merged** into the base weights (`W_new = W + scaling * B @ A`) for zero-overhead inference, or kept separate for easy adapter swapping.
+### 2. Loss Function
 
-### 2. The Injector
+Uses OpenFold's native `AlphaFoldLoss` with the full AlphaFold2 loss formulation:
 
-The `LoraInjector` walks through the model's module tree and replaces every `nn.Linear` whose name matches a target substring. For example, with `target_modules: ["linear_q", "linear_v"]`, it will find and replace layers like:
+| Loss Term | Weight | Description |
+|-----------|--------|-------------|
+| FAPE (backbone + sidechain) | 1.0 | Frame Aligned Point Error — primary structure loss |
+| Distogram | 0.3 | Pairwise CB distance distribution (64 bins) |
+| Masked MSA | 2.0 | BERT-style sequence recovery from MSA |
+| Supervised chi | 1.0 | Torsion angle prediction |
+| pLDDT | 0.01 | Confidence prediction via lDDT binning |
+| Violations | 0.0 | Bond/angle/clash violations (disabled by default) |
 
-```
-evoformer.blocks.0.msa_att.linear_q  -> LoRALinear
-evoformer.blocks.0.msa_att.linear_v  -> LoRALinear
-evoformer.blocks.1.msa_att.linear_q  -> LoRALinear
-...
-```
+Falls back to partial loss computation if model outputs are incomplete (e.g., missing logits).
 
-All other layers remain frozen and untouched.
+### 3. Evaluation Metrics
 
-### 3. Training Loop
+Computed during validation using OpenFold's native utilities:
+
+- **CA-RMSD**: After SVD superimposition (`openfold.utils.superimposition`)
+- **GDT-TS**: Global Distance Test at 1, 2, 4, 8 A thresholds
+- **pLDDT**: Predicted confidence via `openfold.utils.loss.compute_plddt`
+
+Metrics are logged each epoch alongside loss terms.
+
+### 4. Training Loop
 
 The `Trainer` handles the full training lifecycle:
 
-- **Separate learning rates**: LoRA parameters and the prediction head get independent learning rates (typically `lr_lora=5e-5`, `lr_head=5e-4`).
-- **Optimizer**: AdamW with configurable weight decay.
-- **Scheduler**: Linear warmup followed by cosine, linear, or constant decay.
-- **Mixed precision (AMP)**: Uses `torch.autocast` and `GradScaler` for faster training and lower memory.
-- **Gradient accumulation**: Accumulates gradients over N batches before stepping, enabling effective larger batch sizes.
-- **Gradient clipping**: Clips gradient norms to prevent training instability.
-- **EMA (Exponential Moving Average)**: Optionally maintains a shadow copy of parameters for smoother evaluation.
-- **Early stopping**: Monitors validation loss and stops training if it doesn't improve for `patience` epochs.
-- **Checkpointing**: Saves the best model (LoRA weights + head + optimizer state) for resumption.
+- **Separate learning rates** for LoRA parameters and prediction head
+- **AdamW optimizer** with configurable weight decay
+- **Scheduler**: Linear warmup + cosine/linear/constant decay
+- **Mixed precision (AMP)** with `torch.autocast` and `GradScaler`
+- **Gradient accumulation** for effective larger batch sizes
+- **Gradient clipping** to prevent instability
+- **EMA (Exponential Moving Average)** for smoother evaluation
+- **Early stopping** on validation loss
+- **Gradient checkpointing** (40-60% VRAM savings)
+- **Checkpointing** of best model (LoRA weights + optimizer state)
 
-**OpenFold constraint**: The model must remain in `eval()` mode even during training because EvoformerStack's chunked operations require it. Gradients still flow through `requires_grad=True` parameters.
+**OpenFold constraint**: The model remains in `eval()` mode even during training because EvoformerStack's chunked operations require it. Gradients still flow through `requires_grad=True` parameters.
 
-### 4. Data Pipeline
+### 5. MSA Pipeline
 
-**SAbDab Repository**: Queries the Structural Antibody Database for curated antibody PDB IDs, filters by resolution, and downloads PDB files from RCSB. Files are cached locally for reuse.
+MSA (Multiple Sequence Alignment) provides coevolutionary signal that OpenFold uses to predict 3D contacts. Four backends:
 
-**OpenFold Featurizer**: Converts PDB files into OpenFold-compatible feature dictionaries containing:
-- Amino acid types, residue indices
-- All-atom positions and masks (37 atoms per residue)
-- MSA features (multiple sequence alignment)
-- Template placeholders
-- Ground truth labels for structure loss (FAPE, chi angles, distogram, etc.)
+| Backend | Use Case | Dependencies |
+|---------|----------|-------------|
+| `single` | Fast prototyping, no alignment | None |
+| `precomputed` | Load cached `.a3m` / `.msa.pt` files | None |
+| `colabfold` | Query ColabFold MMseqs2 server | Network (public or self-hosted) |
+| `local` | Run MMseqs2/HHblits/JackHMMER locally | Tool binary + sequence database |
 
-**MSA Providers** (three backends):
-- `single`: Dummy MSA with just the query sequence (fast prototyping, no external dependencies).
-- `precomputed`: Loads `.a3m` files from a local directory.
-- `colabfold`: Queries the ColabFold MMseqs2 API for live MSA computation.
+**For antibodies**, we recommend using the `local` backend with the [OAS (Observed Antibody Space)](http://opig.stats.ox.ac.uk/webapps/oas/) database. Generic databases (UniRef, BFD) have poor coverage of CDR regions — OAS provides thousands of antibody-specific hits with real variability in CDR1/CDR2/CDR3.
 
-**StructureDataset**: A PyTorch `Dataset` that loads and featurizes PDB files on-the-fly, with a custom collate function that pads variable-length sequences.
+```yaml
+msa:
+  backend: local
+  tool: mmseqs2
+  database_paths:
+    - /data/oas/oas_db           # antibody-specific
+    - /data/uniref30/uniref30    # general proteins
+  n_cpu: 8
+```
 
-### 5. Inference
+Multiple databases are searched in order and results merged into a single MSA.
+
+MSAs can be pre-generated with the batch script:
+
+```bash
+# With ColabFold public API
+python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa
+
+# With local MMseqs2 + OAS
+python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa \
+    --backend local --database /data/oas/oas_db --database /data/uniref30/uniref30
+
+# With self-hosted ColabFold server
+python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa \
+    --backend colabfold --colabfold-server http://my-server:8080
+```
+
+### 6. Data Pipeline
+
+**SAbDab Repository**: Queries the Structural Antibody Database for curated antibody PDB IDs, filters by resolution, and downloads PDB files from RCSB.
+
+**OpenFold Featurizer**: Converts PDB files into feature dictionaries using OpenFold's native modules:
+- PDB parsing via `openfold.np.protein.from_pdb_string()`
+- Ground truth transforms via `openfold.data.data_transforms` (atom14 masks, backbone frames, chi angles, pseudo-beta)
+- MSA features via `data_transforms.make_msa_feat()` (23-class one-hot + deletion features)
+- Auto-detects antibody chains (H, L) with fallback
+
+**StructureDataset**: PyTorch `Dataset` that loads and featurizes PDB files with MSA integration. Custom collate pads variable-length sequences.
+
+### 7. Inference
 
 The `InferenceService` loads the base OpenFold model and optionally applies a saved LoRA adapter:
 
@@ -79,127 +123,158 @@ The `InferenceService` loads the base OpenFold model and optionally applies a sa
 2. Inject LoRA structure (same rank/alpha/targets as training).
 3. Load saved `lora_A`/`lora_B` weights.
 4. Optionally merge adapters into base weights for faster inference.
-5. Run forward pass and return structure predictions with pLDDT confidence scores.
+5. Output PDB string via `openfold.np.protein.to_pdb()` with pLDDT as B-factors.
 
-### 6. API and CLI
+### 8. API and CLI
 
 **FastAPI** server with versioned endpoints:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/finetune` | POST | Start a fine-tuning job (runs in background, returns job ID) |
+| `/v1/finetune` | POST | Start a fine-tuning job |
 | `/v1/finetune/{id}` | GET | Get job status and metrics |
 | `/v1/predict` | POST | Run structure prediction |
 | `/v1/msa` | POST | Compute MSA for a sequence |
 | `/health` | GET | Health check |
 
-**Typer CLI** with three subcommands:
+**Typer CLI**:
 
 ```bash
 python scripts/finetune.py finetune --config config.yaml
-python scripts/finetune.py predict MKWVTFISLLLLFSSAYS --adapter-path ./checkpoints/final/peft
-python scripts/finetune.py msa MKWVTFISLLLLFSSAYS --backend colabfold
+python scripts/finetune.py predict EVQLVESGG... --adapter-path ./checkpoints/final/peft
+python scripts/finetune.py msa EVQLVESGG... --backend colabfold
 ```
 
 ---
 
 ## Architecture
 
-The project follows a clean Domain-Driven Design with three layers:
+Clean Domain-Driven Design with three layers:
 
 ```
 src/foldfit/
 ├── domain/                          # Pure business logic, no dependencies
-│   ├── value_objects.py             # Immutable configs: LoraConfig, TrainingConfig, etc.
+│   ├── value_objects.py             # Immutable configs: LoraConfig, TrainingConfig, MsaConfig...
 │   ├── interfaces.py                # ABC ports: ModelPort, PeftPort, DatasetPort, MsaPort
 │   └── entities.py                  # TrunkOutput, FinetuneJob, TrainedModel
 ├── application/                     # Use case orchestration
-│   ├── finetune_service.py          # Coordinates: load model -> inject LoRA -> train -> save
+│   ├── finetune_service.py          # Load model -> inject LoRA -> train -> save
 │   ├── inference_service.py         # Load model + adapter -> predict
 │   └── msa_service.py              # MSA computation
-├── infrastructure/                  # Concrete implementations
+├── infrastructure/                  # Concrete implementations (OpenFold-backed)
 │   ├── peft/
-│   │   ├── lora_linear.py           # LoRALinear nn.Module (pure PyTorch)
+│   │   ├── lora_linear.py           # LoRALinear nn.Module
 │   │   └── injector.py             # Walks model tree, replaces target layers
 │   ├── training/
-│   │   ├── trainer.py               # Full training loop
-│   │   └── scheduler.py            # Warmup + cosine/linear/constant
+│   │   ├── trainer.py               # Full training loop with metrics logging
+│   │   ├── scheduler.py            # Warmup + cosine/linear/constant
+│   │   └── checkpointing.py        # Gradient checkpointing
 │   ├── openfold/
 │   │   ├── adapter.py               # Wraps AlphaFold behind ModelPort
-│   │   ├── featurizer.py           # PDB -> feature dict
-│   │   └── loss.py                 # Structure loss (FAPE, pLDDT, etc.)
+│   │   ├── featurizer.py           # PDB -> features (delegates to OpenFold transforms)
+│   │   ├── loss.py                 # Wraps AlphaFoldLoss with partial fallback
+│   │   ├── metrics.py              # RMSD, GDT-TS, pLDDT (uses OpenFold superimposition)
+│   │   └── pdb_writer.py           # Delegates to openfold.np.protein.to_pdb()
 │   ├── data/
 │   │   ├── sabdab_repository.py     # SAbDab query + PDB download
-│   │   ├── structure_dataset.py     # PyTorch Dataset + collate
-│   │   └── msa_provider.py         # single / precomputed / colabfold
+│   │   ├── structure_dataset.py     # PyTorch Dataset + MSA integration + collate
+│   │   └── msa_provider.py         # single / precomputed / colabfold / local
 │   └── checkpoint_store.py          # Save/load LoRA + head + training state
-└── api/
-    ├── app.py                       # FastAPI factory
-    ├── schemas.py                   # Request/response models
-    └── v1/                          # Versioned endpoints
+├── api/
+│   ├── app.py                       # FastAPI factory
+│   ├── schemas.py                   # Request/response models
+│   └── v1/                          # Versioned endpoints
+└── config.py                        # YAML config loader
 ```
-
-All external dependencies (OpenFold, SAbDab API, filesystem) are behind abstract interfaces in `domain/interfaces.py`. The domain layer has zero infrastructure dependencies. This makes every component independently testable with mocks.
 
 ---
 
 ## Quick Start
 
+### Requirements
+
+- Python >= 3.10
+- PyTorch >= 2.0
+- [OpenFold](https://github.com/aqlaboratory/openfold) (required)
+- GPU with >= 12GB VRAM (for training with LoRA + gradient checkpointing)
+
+### Install
+
 ```bash
-# Install
 pip install -e ".[dev]"
+# OpenFold must be installed separately — see their repo for instructions
+```
 
-# Run fine-tuning (requires OpenFold + GPU)
+### Fine-tune
+
+```bash
+# 1. Generate MSAs (optional but recommended)
+python scripts/generate_msa.py --pdb-dir data/sabdab --output-dir data/msa --backend colabfold
+
+# 2. Update config.yaml to point MSA to precomputed
+#    msa:
+#      backend: precomputed
+#      msa_dir: ./data/msa
+
+# 3. Run fine-tuning
 python scripts/finetune.py finetune --config config.yaml
+```
 
-# Compute MSA (works without GPU)
-python scripts/finetune.py msa MKWVTFISLLLLFSSAYS --backend single
+### Predict
 
-# Start API server
+```bash
+python scripts/finetune.py predict EVQLVESGG... --adapter-path ./checkpoints/final/peft
+```
+
+### API Server
+
+```bash
 make run
-# Then open http://localhost:8000/docs for Swagger UI
+# Swagger UI at http://localhost:8000/docs
 ```
 
 ## Configuration
 
-All settings live in `config.yaml` and are validated with Pydantic:
+All settings in `config.yaml`, validated with Pydantic:
 
 ```yaml
 model:
-  weights_path: null         # Path to pretrained OpenFold weights
-  head: structure            # "structure" or "affinity"
+  weights_path: null               # Path to pretrained OpenFold weights
+  head: structure
   device: cuda
 
 data:
-  sabdab_dir: ./data/sabdab  # Local cache for downloaded PDBs
-  max_structures: 200        # Max antibodies to use
-  max_seq_len: 256           # Crop sequences longer than this
-  resolution_max: 3.0        # Only use structures with resolution <= 3A
+  sabdab_dir: ./data/sabdab
+  max_structures: 200
+  max_seq_len: 256
+  resolution_max: 3.0
   val_frac: 0.1
-  split_seed: 42
 
 training:
   epochs: 20
   learning_rate: 5.0e-5
-  lr_lora: 5.0e-5            # LoRA-specific learning rate
-  lr_head: 5.0e-4            # Head-specific learning rate (10x default)
-  scheduler: cosine           # cosine / linear / constant
+  lr_lora: 5.0e-5
+  lr_head: 5.0e-4
+  scheduler: cosine
   warmup_steps: 100
-  accumulation_steps: 4       # Effective batch size = batch_size * 4
-  amp: true                   # Mixed precision
+  accumulation_steps: 4
+  amp: true
   early_stopping_patience: 5
   gradient_checkpointing: true
 
 lora:
-  rank: 8                     # Low-rank dimension (2-64)
-  alpha: 16.0                 # Scaling factor (scaling = alpha / rank = 2.0)
-  dropout: 0.0
-  target_modules:             # Which layers to adapt
-    - linear_q
-    - linear_v
+  rank: 8
+  alpha: 16.0
+  target_modules: [linear_q, linear_v]
 
 msa:
-  backend: single             # single / precomputed / colabfold
+  backend: single                  # single / precomputed / colabfold / local
+  msa_dir: null
+  max_msa_depth: 512
+  colabfold_server: "https://api.colabfold.com"
+  tool: mmseqs2                    # for local backend
+  database_paths: []               # e.g. [/data/oas/oas_db, /data/uniref30/uniref30]
+  n_cpu: 4
 
 output:
   checkpoint_dir: ./checkpoints
@@ -208,7 +283,7 @@ output:
 ## Testing
 
 ```bash
-make test              # All tests with coverage (44 tests)
+make test              # All tests with coverage
 make test-unit         # Unit tests only
 make test-integration  # API integration tests
 make lint              # Ruff linting
@@ -219,5 +294,5 @@ make typecheck         # MyPy type checking
 
 ```bash
 docker compose up --build
-# API available at http://localhost:8000
+# API at http://localhost:8000
 ```

@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.utils.data import DataLoader
 
 from foldfit.domain.entities import FinetuneJob
@@ -15,6 +16,7 @@ from foldfit.domain.value_objects import FoldfitConfig
 from foldfit.infrastructure.data.structure_dataset import StructureDataset, collate_structure_batch
 from foldfit.infrastructure.openfold.featurizer import OpenFoldFeaturizer
 from foldfit.infrastructure.openfold.loss import OpenFoldLoss
+from foldfit.infrastructure.openfold.metrics import compute_metrics
 from foldfit.infrastructure.training.trainer import Trainer
 
 logger = logging.getLogger(__name__)
@@ -111,7 +113,13 @@ class FinetuneService:
                 features, _labels = batch
                 model_adapter.train_mode(True)  # forces eval()
                 output = model_adapter.forward(features)
-                return loss_fn(output.extra.get("_raw_outputs", {}), features)
+                raw_outputs = output.extra.get("_raw_outputs", {})
+                loss_dict = loss_fn(raw_outputs, features)
+                # Attach metrics during eval (no grad context)
+                if not torch.is_grad_enabled():
+                    metrics = compute_metrics(raw_outputs, features)
+                    loss_dict.update(metrics)
+                return loss_dict
 
             history = trainer.fit(
                 model=nn_model,
@@ -188,6 +196,7 @@ class FinetuneService:
         train_ds = StructureDataset(
             pdb_paths=train_paths,
             featurizer=featurizer,
+            msa_provider=self._msa,
         )
         train_loader = DataLoader(
             train_ds,
@@ -202,6 +211,7 @@ class FinetuneService:
             val_ds = StructureDataset(
                 pdb_paths=val_paths,
                 featurizer=featurizer,
+                msa_provider=self._msa,
             )
             val_loader = DataLoader(
                 val_ds,

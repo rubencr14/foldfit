@@ -18,6 +18,8 @@ dependencies = [
     "pyyaml>=6.0",
     "typer>=0.12",
     "httpx>=0.24",
+    "ml-collections>=0.1.1",
+    "biopython>=1.81",
 ]
 
 [project.optional-dependencies]

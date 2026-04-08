@@ -17,24 +17,11 @@ import torch.nn as nn
 from foldfit.domain.entities import TrunkOutput
 from foldfit.domain.interfaces import ModelPort
 
-try:
-    from openfold.config import model_config as openfold_model_config
-    from openfold.model.model import AlphaFold
-    from openfold.utils.loss import compute_plddt
-
-    HAS_OPENFOLD = True
-except ImportError:
-    HAS_OPENFOLD = False
+from openfold.config import model_config as openfold_model_config
+from openfold.model.model import AlphaFold
+from openfold.utils.loss import compute_plddt
 
 logger = logging.getLogger(__name__)
-
-
-def _require_openfold() -> None:
-    if not HAS_OPENFOLD:
-        raise ImportError(
-            "openfold is required for OpenFoldAdapter. "
-            "Install it from: https://github.com/aqlaboratory/openfold"
-        )
 
 
 class OpenFoldAdapter(ModelPort):
@@ -85,8 +72,6 @@ class OpenFoldAdapter(ModelPort):
 
     def _build_model(self) -> nn.Module:
         """Build AlphaFold model from config."""
-        _require_openfold()
-
         if self._config is None:
             self._config = openfold_model_config("model_1")
 
@@ -114,8 +99,7 @@ class OpenFoldAdapter(ModelPort):
         # Compute pLDDT confidence
         confidence = outputs.get("plddt")
         if confidence is None and "sm" in outputs and "single" in outputs["sm"]:
-            if HAS_OPENFOLD:
-                confidence = compute_plddt(outputs["sm"]["single"])
+            confidence = compute_plddt(outputs["sm"]["single"])
 
         return TrunkOutput(
             single_repr=single_repr,
