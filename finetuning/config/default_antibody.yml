@@ -1,0 +1,37 @@
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules:
+    - linear_q
+    - linear_k
+    - linear_v
+    - linear_o
+  target_blocks:
+    - pairformer_stack
+    - diffusion_module
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  max_epochs: 20
+  warmup_steps: 200
+  batch_size: 1
+  ema_decay: 0.999
+  gradient_clip_val: 1.0
+  scheduler: cosine
+  num_workers: 4
+  precision: bf16-mixed
+
+dataset:
+  max_resolution: 3.0
+  require_heavy_chain: true
+  require_light_chain: true
+  cdr_scheme: imgt
+  cache_dir: ./data/antibody_cache
+  train_split: 0.9
+  token_budget: 640
+
+pretrained_checkpoint: null  # Must be provided via CLI
+output_dir: ./output/antibody_lora
+seed: 42

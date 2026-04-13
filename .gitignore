@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 *.egg-info/
 dist/
 build/
@@ -13,45 +14,38 @@ venv/
 env/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
-
-# Testing
-.pytest_cache/
-htmlcov/
-.coverage
-.coverage.*
-
-# MyPy
-.mypy_cache/
-
-# Data and checkpoints
-/data/
-/checkpoints/
-*.pt
-*.pth
-!config.yaml
-
-# Node / Next.js
-node_modules/
-.next/
-out/
-package-lock.json
-
-# Ruff
-.ruff_cache/
-
-# PyTorch extras
-*.ckpt
-*.safetensors
+*~
 
 # OS
 .DS_Store
 Thumbs.db
-*~
 
-# Environment
+# Data & model weights (large files)
+data/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.h5
+*.hdf5
+*.safetensors
+
+# Logs & outputs
+output/
+logs/
+wandb/
+lightning_logs/
+*.log
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc
 .env
-.env.*
+*.bak
