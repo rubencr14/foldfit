@@ -236,6 +236,10 @@ class LoRATrainingModule(pl.LightningModule):
             return None
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Ensure EMA shadow is on the same device as model
+        device = next(self.model.parameters()).device
+        if self.lora_ema.shadow and next(iter(self.lora_ema.shadow.values())).device != device:
+            self.lora_ema.to(device)
         self.lora_ema.update(self.model)
 
     def on_validation_epoch_start(self):
@@ -343,12 +347,8 @@ def main(
         max_epochs = cfg.get("training", {}).get("max_epochs", max_epochs)
         output_dir = Path(cfg.get("output_dir", str(output_dir)))
 
-    if not all([dataset_cache, structure_dir, reference_mol_dir, checkpoint]):
-        click.echo(
-            "Error: must provide --config or all of "
-            "--dataset-cache, --structure-dir, --reference-mol-dir, --checkpoint",
-            err=True,
-        )
+    if checkpoint is None:
+        click.echo("Error: must provide --checkpoint or --config", err=True)
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -369,16 +369,22 @@ def main(
         learning_rate=lr,
     )
 
-    # Build data info
-    data_info = build_data_module(
-        dataset_cache_path=dataset_cache,
-        structure_dir=structure_dir,
-        reference_mol_dir=reference_mol_dir,
-        token_budget=token_budget,
-    )
-
-    logger.info(f"Training with {len(data_info['train_ids'])} structures")
-    logger.info(f"Validating with {len(data_info['val_ids'])} structures")
+    # Build data info (skip if dataset_cache is not a real OF3 cache)
+    data_info = None
+    try:
+        data_info = build_data_module(
+            dataset_cache_path=dataset_cache,
+            structure_dir=structure_dir,
+            reference_mol_dir=reference_mol_dir,
+            token_budget=token_budget,
+        )
+        logger.info(f"Training with {len(data_info['train_ids'])} structures")
+        logger.info(f"Validating with {len(data_info['val_ids'])} structures")
+    except Exception as e:
+        logger.warning(
+            f"Could not load dataset cache: {e}. "
+            "Using synthetic data for training pipeline validation."
+        )
 
     # For now, we use the random_of3_features approach for a working demo
     # TODO: Replace with actual WeightedPDBDataset once full pipeline is set up
@@ -396,24 +402,21 @@ def main(
             return self.n_samples
 
         def __getitem__(self, idx):
+            # random_of3_features already returns batch_size=1 tensors
             batch = random_of3_features(
                 batch_size=1, n_token=self.n_token, n_msa=4, n_templ=1
             )
-            # Squeeze batch dimension
-            batch = {
-                k: v.squeeze(0) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
             batch["pdb_id"] = [f"synthetic_{idx}"]
             batch["preferred_chain_or_interface"] = "A"
             batch["ref_space_uid_to_perm"] = None
 
-            # Add ground truth fields for permutation alignment
             n_token = self.n_token
             batch["mol_entity_id"] = batch["entity_id"].clone()
-            batch["mol_sym_id"] = torch.ones(n_token, dtype=torch.int32)
-            batch["mol_sym_component_id"] = torch.zeros(n_token, dtype=torch.int32)
-            batch["mol_sym_token_index"] = torch.arange(n_token).int()
+            batch["mol_sym_id"] = torch.ones((1, n_token), dtype=torch.int32)
+            batch["mol_sym_component_id"] = torch.zeros((1, n_token), dtype=torch.int32)
+            batch["mol_sym_token_index"] = (
+                torch.arange(n_token).unsqueeze(0).int()
+            )
             batch["ground_truth"]["token_mask"] = batch["token_mask"].clone()
             batch["ground_truth"]["token_index"] = batch["token_index"].clone()
             batch["ground_truth"]["atom_mask"] = batch["atom_mask"].clone()
@@ -439,12 +442,8 @@ def main(
             return batch
 
     def custom_collate(batch_list):
-        """Collate that re-adds batch dimension."""
-        batch = batch_list[0]  # batch_size=1
-        return {
-            k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        """Identity collate - data already has batch dim from random_of3_features."""
+        return batch_list[0]
 
     train_ds = SyntheticTrainingDataset(n_samples=50, n_token=48)
     val_ds = SyntheticTrainingDataset(n_samples=5, n_token=48)

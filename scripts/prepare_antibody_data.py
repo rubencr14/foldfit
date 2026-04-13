@@ -109,15 +109,23 @@ def step_2_preprocess(paths: AntibodyDataPaths, ccd_path: Path, num_workers: int
         preprocess_cif_dir_of3,
     )
 
+    import multiprocessing as mp
+
+    if num_workers > 0:
+        log_queue: mp.Queue = mp.Queue(-1)
+    else:
+        log_queue = None
+
     preprocess_cif_dir_of3(
         cif_dir=paths.raw_cif_dir,
         ccd_path=ccd_path,
         biotite_ccd_path=None,
         out_dir=paths.preprocessed_dir,
-        output_format=["npz"],
+        output_formats=["npz"],
         max_polymer_chains=20,
         num_workers=num_workers,
         chunksize=10,
+        log_queue=log_queue,
         early_stop=None,
     )
 
