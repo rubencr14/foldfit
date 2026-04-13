@@ -1,34 +1,44 @@
 #!/usr/bin/env python
-"""Compute MSAs for antibody sequences using the ColabFold MSA server.
+"""Compute MSAs for antibody sequences.
 
-Reads FASTA files from preprocessed structures and queries the free
-ColabFold API (https://api.colabfold.com) to generate MSAs.
+Supports two methods:
+  - jackhmmer: local search against UniRef90, Mgnify, UniProt, PDB SeqRes
+  - colabfold: free API at https://api.colabfold.com
 
 Usage:
     PYTHONPATH="$PWD:$PWD/openfold-3" python -m finetuning.scripts.compute_msas \
-        --data-dir ./data/antibody_training
+        --config config.yaml
 """
 
 import io
 import logging
+import os
 import shutil
+import subprocess
 import tarfile
+import tempfile
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 
-import numpy as np
 import requests
 import typer
+import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def load_config(config_path: Path) -> dict:
+    """Load configuration from YAML file."""
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
 
 def parse_fasta(fasta_path: Path) -> dict[str, str]:
     """Parse a FASTA file into {chain_id: sequence} dict."""
     sequences = {}
     current_id = None
-    current_seq = []
+    current_seq: list[str] = []
 
     with open(fasta_path) as f:
         for line in f:
@@ -47,18 +57,159 @@ def parse_fasta(fasta_path: Path) -> dict[str, str]:
     return sequences
 
 
+# ---------------------------------------------------------------------------
+# Jackhmmer MSA computation
+# ---------------------------------------------------------------------------
+def run_jackhmmer(
+    sequence: str,
+    output_dir: Path,
+    binary_path: str,
+    database_path: str,
+    database_name: str,
+    n_cpu: int = 8,
+    n_iter: int = 1,
+    e_value: float = 0.0001,
+    max_sequences: int | None = None,
+) -> Path | None:
+    """Run jackhmmer search for a single sequence against a single database.
+
+    Returns path to the output .sto file, or None on failure.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sto_path = output_dir / f"{database_name}_hits.sto"
+
+    if sto_path.exists() and sto_path.stat().st_size > 0:
+        logger.info(f"    {database_name}: already exists, skipping")
+        return sto_path
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".fasta", delete=False) as f:
+        f.write(f">query\n{sequence}\n")
+        fasta_path = f.name
+
+    try:
+        cmd = [
+            binary_path,
+            "-o", "/dev/null",
+            "-A", str(sto_path),
+            "--noali",
+            "--F1", "0.0005",
+            "--F2", "0.00005",
+            "--F3", "0.0000005",
+            "--incE", str(e_value),
+            "-E", str(e_value),
+            "--cpu", str(n_cpu),
+            "-N", str(n_iter),
+            fasta_path,
+            database_path,
+        ]
+
+        logger.info(f"    {database_name}: running jackhmmer...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+        if result.returncode != 0:
+            logger.warning(f"    {database_name}: jackhmmer failed: {result.stderr[:200]}")
+            return None
+
+        if sto_path.exists():
+            logger.info(f"    {database_name}: done -> {sto_path}")
+            return sto_path
+
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(f"    {database_name}: jackhmmer timed out (1h limit)")
+        return None
+    finally:
+        os.unlink(fasta_path)
+
+
+def compute_msas_jackhmmer(
+    structure_dir: Path,
+    alignment_dir: Path,
+    config: dict,
+) -> int:
+    """Compute MSAs using local jackhmmer searches.
+
+    Runs jackhmmer against each configured database for each protein chain.
+    Output files are named to match OpenFold3's max_seq_counts keys:
+      uniref90_hits.sto, mgnify_hits.sto, uniprot_hits.sto, etc.
+    """
+    jackhmmer_cfg = config["msa"]["jackhmmer"]
+    binary_path = jackhmmer_cfg["binary_path"]
+    n_cpu = jackhmmer_cfg.get("n_cpu", 8)
+    n_iter = jackhmmer_cfg.get("n_iter", 1)
+    e_value = jackhmmer_cfg.get("e_value", 0.0001)
+    databases = jackhmmer_cfg["databases"]
+
+    pdb_dirs = sorted(
+        d for d in structure_dir.iterdir()
+        if d.is_dir() and (d / f"{d.name}.fasta").exists()
+    )
+
+    total_searches = 0
+    seen_sequences: dict[str, Path] = {}
+
+    for pdb_dir in pdb_dirs:
+        pdb_id = pdb_dir.name
+        fasta_path = pdb_dir / f"{pdb_id}.fasta"
+        sequences = parse_fasta(fasta_path)
+
+        logger.info(f"Processing {pdb_id} ({len(sequences)} chains)")
+
+        for chain_id, seq in sequences.items():
+            if len(seq) < 20:
+                logger.info(f"  Skipping chain {chain_id} (too short: {len(seq)} aa)")
+                continue
+
+            rep_id = f"{pdb_id}_{chain_id}"
+            chain_alignment_dir = alignment_dir / rep_id
+
+            if seq in seen_sequences:
+                src_dir = seen_sequences[seq]
+                if not chain_alignment_dir.exists():
+                    shutil.copytree(src_dir, chain_alignment_dir)
+                    logger.info(f"  chain {chain_id}: reused MSAs from {src_dir.name}")
+                continue
+
+            logger.info(f"  chain {chain_id} ({len(seq)} aa):")
+
+            for db_name, db_config in databases.items():
+                db_path = db_config["path"]
+                max_seq = db_config.get("max_sequences")
+
+                if not Path(db_path).exists():
+                    logger.warning(f"    {db_name}: database not found at {db_path}, skipping")
+                    continue
+
+                run_jackhmmer(
+                    sequence=seq,
+                    output_dir=chain_alignment_dir,
+                    binary_path=binary_path,
+                    database_path=db_path,
+                    database_name=db_name,
+                    n_cpu=n_cpu,
+                    n_iter=n_iter,
+                    e_value=e_value,
+                    max_sequences=max_seq,
+                )
+                total_searches += 1
+
+            seen_sequences[seq] = chain_alignment_dir
+
+    return total_searches
+
+
+# ---------------------------------------------------------------------------
+# ColabFold MSA computation
+# ---------------------------------------------------------------------------
 def query_colabfold(
     sequence: str,
     output_dir: Path,
     chain_id: str,
-    user_agent: str = "openfold3-lora",
     host_url: str = "https://api.colabfold.com",
+    user_agent: str = "openfold3-lora",
     max_retries: int = 5,
 ) -> Path | None:
-    """Query ColabFold MSA server for a single sequence.
-
-    Returns path to the a3m file, or None if failed.
-    """
+    """Query ColabFold MSA server for a single sequence."""
     output_dir.mkdir(parents=True, exist_ok=True)
     a3m_path = output_dir / f"{chain_id}.a3m"
 
@@ -84,11 +235,7 @@ def query_colabfold(
                 )
                 status_response.raise_for_status()
                 status = status_response.json()
-
-                if status["status"] == "COMPLETE":
-                    break
-                elif status["status"] == "ERROR":
-                    logger.warning(f"  MSA server error for chain {chain_id}")
+                if status["status"] in ("COMPLETE", "ERROR"):
                     break
                 time.sleep(2)
 
@@ -102,7 +249,7 @@ def query_colabfold(
                 tar_bytes = io.BytesIO(result_response.content)
                 with tarfile.open(fileobj=tar_bytes, mode="r:gz") as tar:
                     for member in tar.getmembers():
-                        if member.name.endswith(".a3m") and "uniref" in member.name.lower():
+                        if member.name.endswith(".a3m"):
                             f = tar.extractfile(member)
                             if f:
                                 a3m_content = f.read().decode("utf-8")
@@ -111,27 +258,13 @@ def query_colabfold(
                                 logger.info(f"  Saved MSA: {a3m_path} ({len(a3m_content.splitlines())} lines)")
                                 return a3m_path
 
-                    for member in tar.getmembers():
-                        if member.name.endswith(".a3m"):
-                            f = tar.extractfile(member)
-                            if f:
-                                a3m_content = f.read().decode("utf-8")
-                                with open(a3m_path, "w") as out:
-                                    out.write(a3m_content)
-                                logger.info(f"  Saved MSA: {a3m_path}")
-                                return a3m_path
-
-                logger.warning(f"  No a3m file found in response for chain {chain_id}")
-                return None
+            return None
 
         except requests.exceptions.RequestException as e:
-            logger.warning(f"  Attempt {attempt + 1}/{max_retries} failed for chain {chain_id}: {e}")
+            logger.warning(f"  Attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                wait = 10 * (attempt + 1)
-                logger.info(f"  Retrying in {wait}s...")
-                time.sleep(wait)
+                time.sleep(10 * (attempt + 1))
 
-    logger.error(f"  Failed to get MSA for chain {chain_id} after {max_retries} attempts")
     return None
 
 
@@ -142,7 +275,7 @@ def fix_a3m_lengths(a3m_path: Path) -> int:
 
     entries = []
     header = None
-    seq_lines = []
+    seq_lines: list[str] = []
     for line in lines:
         if line.startswith(">"):
             if header is not None:
@@ -164,11 +297,8 @@ def fix_a3m_lengths(a3m_path: Path) -> int:
     with open(a3m_path, "w") as f:
         for header, seq in entries:
             filtered = "".join(c for c in seq if not c.islower())
-            if len(filtered) > query_len:
-                filtered = filtered[:query_len]
-                fixed += 1
-            elif len(filtered) < query_len:
-                filtered += "-" * (query_len - len(filtered))
+            if len(filtered) != query_len:
+                filtered = filtered[:query_len] if len(filtered) > query_len else filtered + "-" * (query_len - len(filtered))
                 fixed += 1
             f.write(header)
             f.write(filtered + "\n")
@@ -176,110 +306,111 @@ def fix_a3m_lengths(a3m_path: Path) -> int:
     return fixed
 
 
-app = typer.Typer()
-
-
-@app.command()
-def main(
-    data_dir: Annotated[Path, typer.Option(help="Root data directory (with preprocessed/ subdirectory)")],
-    user_agent: Annotated[str, typer.Option(help="User agent for ColabFold API")] = "openfold3-antibody-lora",
-    skip_existing: Annotated[bool, typer.Option(help="Skip sequences with existing MSAs")] = True,
-):
-    """Compute MSAs for preprocessed antibody structures using ColabFold."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    structure_dir = data_dir / "preprocessed" / "structure_files"
-    msa_dir = data_dir / "msas"
-    alignment_dir = data_dir / "alignments"
-
-    if not structure_dir.exists():
-        logger.error(f"Structure directory not found: {structure_dir}")
-        logger.error("Run prepare_antibody_data.py first!")
-        raise typer.Exit(1)
+def compute_msas_colabfold(
+    structure_dir: Path,
+    alignment_dir: Path,
+    msa_dir: Path,
+    config: dict,
+) -> int:
+    """Compute MSAs using the free ColabFold API."""
+    colabfold_cfg = config["msa"]["colabfold"]
+    host_url = colabfold_cfg.get("host_url", "https://api.colabfold.com")
+    user_agent = colabfold_cfg.get("user_agent", "openfold3-lora")
 
     pdb_dirs = sorted(
         d for d in structure_dir.iterdir()
         if d.is_dir() and (d / f"{d.name}.fasta").exists()
     )
-    logger.info(f"Found {len(pdb_dirs)} structures with FASTA files")
-
-    # Step 1: Compute MSAs via ColabFold
-    logger.info("=" * 60)
-    logger.info("STEP 1: Computing MSAs via ColabFold server")
-    logger.info("=" * 60)
 
     total_queries = 0
     seen_sequences: dict[str, Path] = {}
 
     for pdb_dir in pdb_dirs:
         pdb_id = pdb_dir.name
-        fasta_path = pdb_dir / f"{pdb_id}.fasta"
-        sequences = parse_fasta(fasta_path)
-
-        pdb_msa_dir = msa_dir / pdb_id
+        sequences = parse_fasta(pdb_dir / f"{pdb_id}.fasta")
         logger.info(f"Processing {pdb_id} ({len(sequences)} chains)")
 
         for chain_id, seq in sequences.items():
             if len(seq) < 20:
-                logger.info(f"  Skipping chain {chain_id} (too short: {len(seq)} aa)")
                 continue
 
+            pdb_msa_dir = msa_dir / pdb_id
+            rep_id = f"{pdb_id}_{chain_id}"
+
             if seq in seen_sequences:
-                existing_path = seen_sequences[seq]
-                pdb_msa_dir.mkdir(parents=True, exist_ok=True)
-                target = pdb_msa_dir / f"{chain_id}.a3m"
-                if not target.exists():
-                    shutil.copy2(existing_path, target)
-                    logger.info(f"  Reused MSA for chain {chain_id} (duplicate sequence)")
+                src = seen_sequences[seq]
+                rep_dir = alignment_dir / rep_id
+                if not rep_dir.exists():
+                    shutil.copytree(src, rep_dir)
+                    logger.info(f"  chain {chain_id}: reused from {src.name}")
                 continue
 
             result = query_colabfold(
                 sequence=seq, output_dir=pdb_msa_dir, chain_id=chain_id,
-                user_agent=user_agent,
+                host_url=host_url, user_agent=user_agent,
             )
 
             if result is not None:
-                seen_sequences[seq] = result
+                fix_a3m_lengths(result)
+                rep_dir = alignment_dir / rep_id
+                rep_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(result, rep_dir / "colabfold_main.a3m")
+                seen_sequences[seq] = rep_dir
 
             total_queries += 1
-
             if total_queries % 5 == 0:
-                logger.info(f"  Rate limiting pause (queried {total_queries} sequences)...")
+                logger.info(f"  Rate limiting pause ({total_queries} queries)...")
                 time.sleep(5)
 
-    logger.info(f"Computed {total_queries} MSA queries")
+    return total_queries
 
-    # Step 2: Fix a3m lengths and create alignment directories
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+app = typer.Typer()
+
+
+@app.command()
+def main(
+    config: Annotated[Path, typer.Option(help="Path to config.yaml")],
+    data_dir: Annotated[Optional[Path], typer.Option(help="Override data directory from config")] = None,
+):
+    """Compute MSAs for preprocessed antibody structures.
+
+    Uses jackhmmer (local databases) or ColabFold (free API) based on config.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    cfg = load_config(config)
+
+    data_path = Path(data_dir) if data_dir else Path(cfg["paths"]["data_dir"])
+    structure_dir = data_path / "preprocessed" / "structure_files"
+    alignment_dir = data_path / "alignments"
+    msa_dir = data_path / "msas"
+
+    if not structure_dir.exists():
+        logger.error(f"Structure directory not found: {structure_dir}")
+        logger.error("Run prepare_antibody_data first!")
+        raise typer.Exit(1)
+
+    method = cfg["msa"]["method"]
+    logger.info(f"MSA method: {method}")
     logger.info("=" * 60)
-    logger.info("STEP 2: Creating alignment directories for OF3")
-    logger.info("=" * 60)
 
-    for pdb_dir in sorted(msa_dir.iterdir()):
-        if not pdb_dir.is_dir():
-            continue
-        pdb_id = pdb_dir.name
-
-        for a3m_file in pdb_dir.glob("*.a3m"):
-            chain_id = a3m_file.stem
-
-            n_fixed = fix_a3m_lengths(a3m_file)
-            if n_fixed:
-                logger.info(f"  Fixed {n_fixed} sequence lengths in {a3m_file.name}")
-
-            rep_id = f"{pdb_id}_{chain_id}"
-            rep_dir = alignment_dir / rep_id
-            rep_dir.mkdir(parents=True, exist_ok=True)
-            target = rep_dir / "colabfold_main.a3m"
-            if not target.exists():
-                shutil.copy2(a3m_file, target)
-            logger.info(f"  Alignment: {rep_dir.name}/colabfold_main.a3m")
+    if method == "jackhmmer":
+        total = compute_msas_jackhmmer(structure_dir, alignment_dir, cfg)
+        logger.info(f"Completed {total} jackhmmer searches")
+    elif method == "colabfold":
+        total = compute_msas_colabfold(structure_dir, alignment_dir, msa_dir, cfg)
+        logger.info(f"Completed {total} ColabFold queries")
+    else:
+        logger.error(f"Unknown MSA method: {method}. Use 'jackhmmer' or 'colabfold'")
+        raise typer.Exit(1)
 
     logger.info("=" * 60)
     logger.info("MSA COMPUTATION COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"MSA files:        {msa_dir}")
-    logger.info(f"Alignment dirs:   {alignment_dir}")
-    logger.info(f"Total queries:    {total_queries}")
+    logger.info(f"Alignments: {alignment_dir}")
 
 
 if __name__ == "__main__":

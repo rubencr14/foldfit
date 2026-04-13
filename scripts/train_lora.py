@@ -24,6 +24,7 @@ import pytorch_lightning as pl
 import torch
 import torch.utils.data
 import typer
+import yaml
 
 from openfold3.core.data.framework.single_datasets.abstract_single import (
     DATASET_REGISTRY,
@@ -185,23 +186,50 @@ app = typer.Typer()
 
 @app.command()
 def main(
-    dataset_cache: Annotated[Path, typer.Option(help="Path to dataset_cache.json")],
-    structure_dir: Annotated[Path, typer.Option(help="Path to preprocessed structure_files/")],
-    reference_mol_dir: Annotated[Path, typer.Option(help="Path to reference_mols/")],
-    checkpoint: Annotated[Path, typer.Option(help="Path to pretrained OF3 checkpoint")],
-    alignment_dir: Annotated[Optional[Path], typer.Option(help="Path to alignments/")] = None,
-    output_dir: Annotated[Path, typer.Option(help="Output directory")] = Path("./output/lora_antibody"),
-    max_epochs: Annotated[int, typer.Option(help="Number of training epochs")] = 5,
-    lr: Annotated[float, typer.Option(help="Learning rate")] = 5e-5,
-    lora_rank: Annotated[int, typer.Option(help="LoRA rank")] = 8,
-    lora_alpha: Annotated[float, typer.Option(help="LoRA alpha")] = 16.0,
-    token_budget: Annotated[int, typer.Option(help="Max tokens per crop")] = 128,
-    devices: Annotated[int, typer.Option(help="Number of GPUs")] = 1,
+    config: Annotated[Path, typer.Option(help="Path to config.yaml")] = Path("config.yaml"),
+    dataset_cache: Annotated[Optional[Path], typer.Option(help="Override dataset_cache.json path")] = None,
+    structure_dir: Annotated[Optional[Path], typer.Option(help="Override structure_files/ path")] = None,
+    reference_mol_dir: Annotated[Optional[Path], typer.Option(help="Override reference_mols/ path")] = None,
+    checkpoint: Annotated[Optional[Path], typer.Option(help="Override pretrained checkpoint path")] = None,
+    alignment_dir: Annotated[Optional[Path], typer.Option(help="Override alignments/ path")] = None,
+    output_dir: Annotated[Optional[Path], typer.Option(help="Override output directory")] = None,
+    max_epochs: Annotated[Optional[int], typer.Option(help="Override max epochs")] = None,
+    lr: Annotated[Optional[float], typer.Option(help="Override learning rate")] = None,
+    token_budget: Annotated[Optional[int], typer.Option(help="Override token budget")] = None,
+    devices: Annotated[Optional[int], typer.Option(help="Override number of GPUs")] = None,
 ):
-    """Run LoRA fine-tuning on real antibody structures."""
+    """Run LoRA fine-tuning on real antibody structures.
+
+    Reads all settings from config.yaml. CLI options override config values.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    # Load config
+    with open(config) as f:
+        cfg = yaml.safe_load(f)
+
+    # Resolve paths from config, with CLI overrides
+    data_dir = Path(cfg["paths"]["data_dir"])
+    dataset_cache = dataset_cache or data_dir / "dataset_cache.json"
+    structure_dir = structure_dir or data_dir / "preprocessed" / "structure_files"
+    reference_mol_dir = reference_mol_dir or data_dir / "preprocessed" / "reference_mols"
+    alignment_dir = alignment_dir or data_dir / "alignments"
+    checkpoint = checkpoint or Path(cfg["paths"]["checkpoint"]).expanduser()
+    output_dir = output_dir or Path(cfg["paths"]["output_dir"])
+
+    # Training params from config, with CLI overrides
+    train_cfg = cfg["training"]
+    max_epochs = max_epochs or train_cfg["max_epochs"]
+    lr = lr or train_cfg["learning_rate"]
+    token_budget = token_budget or train_cfg["token_budget"]
+    devices = devices or train_cfg["devices"]
+    seed = train_cfg.get("seed", 42)
+
+    # LoRA params from config
+    lora_cfg = cfg["lora"]
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    pl.seed_everything(42)
+    pl.seed_everything(seed)
     torch.set_float32_matmul_precision("medium")
 
     # 1. Build model + LoRA
@@ -215,9 +243,11 @@ def main(
     gc.collect()
 
     lora_config = LoRAConfig(
-        rank=lora_rank, alpha=lora_alpha, dropout=0.05,
-        target_modules=["linear_q", "linear_k", "linear_v", "linear_o"],
-        target_blocks=["pairformer_stack"],
+        rank=lora_cfg["rank"],
+        alpha=lora_cfg["alpha"],
+        dropout=lora_cfg.get("dropout", 0.05),
+        target_modules=lora_cfg["target_modules"],
+        target_blocks=lora_cfg["target_blocks"],
     )
     applicator = LoRAApplicator(lora_config)
     n = applicator.apply(model)
@@ -252,8 +282,10 @@ def main(
     ckpt_cb = pl.callbacks.ModelCheckpoint(
         dirpath=output_dir / "checkpoints", save_last=True, every_n_train_steps=5)
     trainer = pl.Trainer(
-        max_epochs=max_epochs, devices=devices, precision="bf16-mixed",
-        gradient_clip_val=1.0, callbacks=[ckpt_cb],
+        max_epochs=max_epochs, devices=devices,
+        precision=train_cfg.get("precision", "bf16-mixed"),
+        gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
+        callbacks=[ckpt_cb],
         default_root_dir=str(output_dir), log_every_n_steps=1,
         enable_progress_bar=True,
     )

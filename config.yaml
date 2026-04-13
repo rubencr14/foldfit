@@ -1,0 +1,88 @@
+# FoldFit Configuration
+# All paths and parameters for antibody LoRA fine-tuning of OpenFold3
+
+# ---- Paths ----
+paths:
+  openfold3_dir: ../openfold-3              # Path to OpenFold3 repository
+  checkpoint: ~/.openfold3/of3-p2-155k.pt   # Pretrained model weights
+  ccd: ~/.openfold3/chemical_component_dictionary.cif  # Chemical Component Dictionary
+  output_dir: ./output/lora_antibody        # Training output directory
+  data_dir: ./data/antibody_training        # Root for all preprocessed data
+
+# ---- Data Acquisition ----
+data:
+  max_structures: 100           # Max antibody structures to download from RCSB
+  max_resolution: 3.0           # Resolution cutoff in Angstroms
+  pdb_ids_file: null            # Optional: path to file with PDB IDs (one per line)
+
+# ---- MSA Configuration ----
+msa:
+  # Method: "colabfold" (free API) or "jackhmmer" (local databases)
+  method: jackhmmer
+
+  colabfold:
+    host_url: https://api.colabfold.com
+    user_agent: openfold3-antibody-lora
+
+  jackhmmer:
+    binary_path: /usr/bin/jackhmmer        # Path to jackhmmer binary
+    n_cpu: 8                               # CPUs per jackhmmer search
+    n_iter: 1                              # Number of jackhmmer iterations
+    e_value: 0.0001                        # E-value threshold
+
+    # Sequence databases for jackhmmer (FASTA format)
+    # These are the standard databases used by AlphaFold/OpenFold
+    databases:
+      uniref90:
+        path: /data/databases/uniref90/uniref90.fasta
+        max_sequences: 10000
+      mgnify:
+        path: /data/databases/mgnify/mgy_clusters_2022_05.fa
+        max_sequences: 5000
+      uniprot:
+        path: /data/databases/uniprot/uniprot.fasta
+        max_sequences: 50000
+      pdb_seqres:
+        path: /data/databases/pdb_seqres/pdb_seqres.txt
+        max_sequences: 10000
+
+  # HHblits (optional, for paired MSAs)
+  hhblits:
+    binary_path: /usr/bin/hhblits
+    databases:
+      uniref30:
+        path: /data/databases/uniref30/UniRef30_2023_02
+      bfd:
+        path: /data/databases/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt
+
+# ---- LoRA Configuration ----
+lora:
+  rank: 8                       # Rank of low-rank decomposition
+  alpha: 16.0                   # Scaling factor (effective = alpha/rank)
+  dropout: 0.05                 # Dropout on LoRA branch
+  target_modules:               # Linear layers to adapt
+    - linear_q
+    - linear_k
+    - linear_v
+    - linear_o
+  target_blocks:                # Model blocks to apply LoRA to
+    - pairformer_stack
+
+# ---- Training Configuration ----
+training:
+  max_epochs: 50
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_clip_val: 1.0
+  scheduler: cosine             # cosine | linear
+  precision: bf16-mixed
+  ema_decay: 0.999
+  seed: 42
+  token_budget: 256             # Max tokens per crop (controls VRAM usage)
+  devices: 1                    # Number of GPUs
+
+# ---- Preprocessing ----
+preprocessing:
+  num_workers: 0                # 0 = single-threaded (avoids slow CCD loading per worker)
+  max_polymer_chains: 20        # Skip structures with more chains than this
