@@ -306,6 +306,172 @@ def fix_a3m_lengths(a3m_path: Path) -> int:
     return fixed
 
 
+# ---------------------------------------------------------------------------
+# MMseqs2 MSA computation
+# ---------------------------------------------------------------------------
+def run_mmseqs(
+    sequence: str,
+    output_dir: Path,
+    database_name: str,
+    binary_path: str,
+    database_path: str,
+    n_cpu: int = 8,
+    sensitivity: float = 7.5,
+    max_seqs: int = 10000,
+    e_value: float = 0.001,
+) -> Path | None:
+    """Run MMseqs2 search for a single sequence against a database.
+
+    Returns path to the output .a3m file, or None on failure.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    a3m_path = output_dir / f"{database_name}_hits.a3m"
+
+    if a3m_path.exists() and a3m_path.stat().st_size > 0:
+        logger.info(f"    {database_name}: already exists, skipping")
+        return a3m_path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        query_fasta = Path(tmpdir) / "query.fasta"
+        query_fasta.write_text(f">query\n{sequence}\n")
+
+        query_db = Path(tmpdir) / "query_db"
+        result_db = Path(tmpdir) / "result_db"
+        result_a3m = Path(tmpdir) / "result.a3m"
+        tmp_dir = Path(tmpdir) / "tmp"
+        tmp_dir.mkdir()
+
+        try:
+            # Step 1: Create query database
+            subprocess.run(
+                [binary_path, "createdb", str(query_fasta), str(query_db)],
+                capture_output=True, text=True, check=True,
+            )
+
+            # Step 2: Search
+            search_cmd = [
+                binary_path, "search",
+                str(query_db), database_path, str(result_db), str(tmp_dir),
+                "--threads", str(n_cpu),
+                "-s", str(sensitivity),
+                "--max-seqs", str(max_seqs),
+                "-e", str(e_value),
+            ]
+            logger.info(f"    {database_name}: running mmseqs search...")
+            result = subprocess.run(
+                search_cmd, capture_output=True, text=True, timeout=3600,
+            )
+            if result.returncode != 0:
+                logger.warning(f"    {database_name}: mmseqs search failed: {result.stderr[:200]}")
+                return None
+
+            # Step 3: Convert to a3m
+            subprocess.run(
+                [binary_path, "result2msa",
+                 str(query_db), database_path, str(result_db), str(result_a3m),
+                 "--msa-format-mode", "6"],
+                capture_output=True, text=True, check=True,
+            )
+
+            if result_a3m.exists() and result_a3m.stat().st_size > 0:
+                shutil.copy2(result_a3m, a3m_path)
+                n_seqs = sum(1 for line in open(a3m_path) if line.startswith(">"))
+                logger.info(f"    {database_name}: done -> {n_seqs} sequences")
+                return a3m_path
+
+            return None
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"    {database_name}: mmseqs timed out (1h limit)")
+            return None
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"    {database_name}: mmseqs failed: {e}")
+            return None
+
+
+def compute_msas_mmseqs(
+    structure_dir: Path,
+    alignment_dir: Path,
+    config: dict,
+) -> int:
+    """Compute MSAs using local MMseqs2 searches.
+
+    Faster than jackhmmer with comparable sensitivity at high -s values.
+    Output files named {db_name}_hits.a3m in each alignment directory.
+    """
+    mmseqs_cfg = config["msa"]["mmseqs"]
+    binary_path = mmseqs_cfg["binary_path"]
+    n_cpu = mmseqs_cfg.get("n_cpu", 8)
+    sensitivity = mmseqs_cfg.get("sensitivity", 7.5)
+    max_seqs = mmseqs_cfg.get("max_seqs", 10000)
+    e_value = mmseqs_cfg.get("e_value", 0.001)
+    databases = mmseqs_cfg["databases"]
+
+    pdb_dirs = sorted(
+        d for d in structure_dir.iterdir()
+        if d.is_dir() and (d / f"{d.name}.fasta").exists()
+    )
+
+    total_searches = 0
+    seen_sequences: dict[str, Path] = {}
+
+    for pdb_dir in pdb_dirs:
+        pdb_id = pdb_dir.name
+        sequences = parse_fasta(pdb_dir / f"{pdb_id}.fasta")
+        logger.info(f"Processing {pdb_id} ({len(sequences)} chains)")
+
+        for chain_id, seq in sequences.items():
+            if len(seq) < 20:
+                logger.info(f"  Skipping chain {chain_id} (too short: {len(seq)} aa)")
+                continue
+
+            rep_id = f"{pdb_id}_{chain_id}"
+            chain_alignment_dir = alignment_dir / rep_id
+
+            if seq in seen_sequences:
+                src_dir = seen_sequences[seq]
+                if not chain_alignment_dir.exists():
+                    shutil.copytree(src_dir, chain_alignment_dir)
+                    logger.info(f"  chain {chain_id}: reused MSAs from {src_dir.name}")
+                continue
+
+            logger.info(f"  chain {chain_id} ({len(seq)} aa):")
+
+            for db_name, db_config in databases.items():
+                db_path = db_config["path"]
+
+                if not Path(db_path).exists() and not Path(db_path + ".index").exists():
+                    logger.warning(f"    {db_name}: database not found at {db_path}, skipping")
+                    continue
+
+                # output_name must match OF3's max_seq_counts keys
+                out_name = db_config.get("output_name", f"{db_name}_hits")
+
+                result = run_mmseqs(
+                    sequence=seq,
+                    output_dir=chain_alignment_dir,
+                    database_name=out_name,
+                    binary_path=binary_path,
+                    database_path=db_path,
+                    n_cpu=n_cpu,
+                    sensitivity=sensitivity,
+                    max_seqs=max_seqs,
+                    e_value=e_value,
+                )
+
+                if result is not None:
+                    fix_a3m_lengths(result)
+
+                total_searches += 1
+
+            seen_sequences[seq] = chain_alignment_dir
+
+    return total_searches
+
+
+# ---------------------------------------------------------------------------
+# ColabFold MSA computation
+# ---------------------------------------------------------------------------
 def compute_msas_colabfold(
     structure_dir: Path,
     alignment_dir: Path,
@@ -401,11 +567,14 @@ def main(
     if method == "jackhmmer":
         total = compute_msas_jackhmmer(structure_dir, alignment_dir, cfg)
         logger.info(f"Completed {total} jackhmmer searches")
+    elif method == "mmseqs":
+        total = compute_msas_mmseqs(structure_dir, alignment_dir, cfg)
+        logger.info(f"Completed {total} MMseqs2 searches")
     elif method == "colabfold":
         total = compute_msas_colabfold(structure_dir, alignment_dir, msa_dir, cfg)
         logger.info(f"Completed {total} ColabFold queries")
     else:
-        logger.error(f"Unknown MSA method: {method}. Use 'jackhmmer' or 'colabfold'")
+        logger.error(f"Unknown MSA method: {method}. Use 'jackhmmer', 'mmseqs', or 'colabfold'")
         raise typer.Exit(1)
 
     logger.info("=" * 60)

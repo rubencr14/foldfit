@@ -3,35 +3,33 @@
 
 # ---- Paths ----
 paths:
-  openfold3_dir: ../openfold-3              # Path to OpenFold3 repository
-  checkpoint: ~/.openfold3/of3-p2-155k.pt   # Pretrained model weights
-  ccd: ~/.openfold3/chemical_component_dictionary.cif  # Chemical Component Dictionary
-  output_dir: ./output/lora_antibody        # Training output directory
-  data_dir: ./data/antibody_training        # Root for all preprocessed data
+  openfold3_dir: ../openfold-3
+  checkpoint: ~/.openfold3/of3-p2-155k.pt
+  ccd: ~/.openfold3/chemical_component_dictionary.cif
+  output_dir: ./output/lora_antibody
+  data_dir: ./data/antibody_training
+  databases_dir: /home/rubencr/Escritorio/projects/molserve/data
 
 # ---- Data Acquisition ----
 data:
-  max_structures: 100           # Max antibody structures to download from RCSB
-  max_resolution: 3.0           # Resolution cutoff in Angstroms
-  pdb_ids_file: null            # Optional: path to file with PDB IDs (one per line)
+  max_structures: 100
+  max_resolution: 3.0
+  pdb_ids_file: null
 
 # ---- MSA Configuration ----
 msa:
-  # Method: "colabfold" (free API) or "jackhmmer" (local databases)
-  method: jackhmmer
+  # Method: "colabfold" | "jackhmmer" | "mmseqs"
+  method: mmseqs
 
   colabfold:
     host_url: https://api.colabfold.com
     user_agent: openfold3-antibody-lora
 
   jackhmmer:
-    binary_path: /usr/bin/jackhmmer        # Path to jackhmmer binary
-    n_cpu: 8                               # CPUs per jackhmmer search
-    n_iter: 1                              # Number of jackhmmer iterations
-    e_value: 0.0001                        # E-value threshold
-
-    # Sequence databases for jackhmmer (FASTA format)
-    # These are the standard databases used by AlphaFold/OpenFold
+    binary_path: /usr/bin/jackhmmer
+    n_cpu: 8
+    n_iter: 1
+    e_value: 0.0001
     databases:
       uniref90:
         path: /data/databases/uniref90/uniref90.fasta
@@ -42,30 +40,40 @@ msa:
       uniprot:
         path: /data/databases/uniprot/uniprot.fasta
         max_sequences: 50000
-      pdb_seqres:
-        path: /data/databases/pdb_seqres/pdb_seqres.txt
-        max_sequences: 10000
 
-  # HHblits (optional, for paired MSAs)
+  mmseqs:
+    binary_path: /home/rubencr/miniconda3/envs/nomosis/bin/mmseqs
+    n_cpu: 8
+    sensitivity: 7.5           # -s parameter (1-7.5, higher = more sensitive)
+    max_seqs: 10000            # --max-seqs
+    e_value: 0.001
+    databases:
+      swissprot:
+        path: /home/rubencr/Escritorio/projects/molserve/data/mmseqs_db/swissprot
+        max_sequences: 10000
+        # output_name: OF3 filters MSA files by filename against max_seq_counts.
+        # This must match a key like "uniref90_hits", "uniprot_hits", etc.
+        output_name: uniref90_hits
+
   hhblits:
     binary_path: /usr/bin/hhblits
+    n_cpu: 4
+    n_iter: 2
     databases:
-      uniref30:
-        path: /data/databases/uniref30/UniRef30_2023_02
-      bfd:
-        path: /data/databases/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt
+      pdb100:
+        path: /home/rubencr/Escritorio/projects/molserve/data/hhblits_db/pdb100
 
 # ---- LoRA Configuration ----
 lora:
-  rank: 8                       # Rank of low-rank decomposition
-  alpha: 16.0                   # Scaling factor (effective = alpha/rank)
-  dropout: 0.05                 # Dropout on LoRA branch
-  target_modules:               # Linear layers to adapt
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules:
     - linear_q
     - linear_k
     - linear_v
     - linear_o
-  target_blocks:                # Model blocks to apply LoRA to
+  target_blocks:
     - pairformer_stack
 
 # ---- Training Configuration ----
@@ -75,14 +83,14 @@ training:
   weight_decay: 0.01
   warmup_steps: 100
   gradient_clip_val: 1.0
-  scheduler: cosine             # cosine | linear
+  scheduler: cosine
   precision: bf16-mixed
   ema_decay: 0.999
   seed: 42
-  token_budget: 256             # Max tokens per crop (controls VRAM usage)
-  devices: 1                    # Number of GPUs
+  token_budget: 256
+  devices: 1
 
 # ---- Preprocessing ----
 preprocessing:
-  num_workers: 0                # 0 = single-threaded (avoids slow CCD loading per worker)
-  max_polymer_chains: 20        # Skip structures with more chains than this
+  num_workers: 0
+  max_polymer_chains: 20
