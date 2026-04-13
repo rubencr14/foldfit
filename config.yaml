@@ -8,7 +8,7 @@ paths:
   ccd: ~/.openfold3/chemical_component_dictionary.cif
   output_dir: ./output/lora_antibody
   data_dir: ./data/antibody_training
-  databases_dir: /home/rubencr/Escritorio/projects/molserve/data
+  databases_dir: <PATH_TO_DATABASES>          # directory containing mmseqs_db/, hhblits_db/
 
 # ---- Data Acquisition ----
 data:
@@ -42,14 +42,14 @@ msa:
         max_sequences: 50000
 
   mmseqs:
-    binary_path: /home/rubencr/miniconda3/envs/nomosis/bin/mmseqs
+    binary_path: <PATH_TO_MMSEQS_BINARY>      # e.g. /usr/bin/mmseqs or $(which mmseqs)
     n_cpu: 8
     sensitivity: 7.5           # -s parameter (1-7.5, higher = more sensitive)
     max_seqs: 10000            # --max-seqs
     e_value: 0.001
     databases:
       swissprot:
-        path: /home/rubencr/Escritorio/projects/molserve/data/mmseqs_db/swissprot
+        path: <PATH_TO_DATABASES>/mmseqs_db/swissprot
         max_sequences: 10000
         # output_name: OF3 filters MSA files by filename against max_seq_counts.
         # This must match a key like "uniref90_hits", "uniprot_hits", etc.
@@ -61,7 +61,7 @@ msa:
     n_iter: 2
     databases:
       pdb100:
-        path: /home/rubencr/Escritorio/projects/molserve/data/hhblits_db/pdb100
+        path: <PATH_TO_DATABASES>/hhblits_db/pdb100
 
 # ---- LoRA Configuration ----
 lora:
