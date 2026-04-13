@@ -8,99 +8,109 @@ Parameter-efficient fine-tuning of [OpenFold3](https://github.com/aqlaboratory/o
 graph TD
     A[RCSB PDB] -->|fetch antibody structures| B[Raw mmCIF files]
     B -->|preprocess_pdb_of3| C[NPZ structure files + metadata]
-    C -->|compute_msas.py| D[MSA alignments via ColabFold]
-    
+    C -->|compute_msas| D[MSA alignments]
+
     E[S3: openfold3-data] -->|download| F[Pretrained weights 2.2GB]
-    E -->|download| G[Chemical Component Dictionary 427MB]
-    
-    C --> H[Dataset Cache - ClusteredDatasetCache]
+    E -->|download| G[CCD 427MB]
+
+    C --> H[Dataset Cache]
     D --> H
-    
+
     H --> I[OF3 WeightedPDBDataset]
-    I -->|featurize: structure + MSA + templates| J[Feature Dict per sample]
-    
+    I -->|featurize| J[Feature Dict]
+
     F --> K[OpenFold3 Model]
-    K -->|apply LoRA to PairFormer attention| L[Model with LoRA adapters]
-    L -->|freeze base params| M[Only LoRA params trainable 0.57%]
-    
-    J --> N[Training Loop - PyTorch Lightning]
+    K -->|apply LoRA| L[LoRA adapters on PairFormer]
+    L -->|freeze base| M[Only 0.57% params trainable]
+
+    J --> N[Training Loop]
     M --> N
-    N -->|forward + loss + backward| O[LoRA weights updated]
-    O -->|save| P[LoRA checkpoint ~4.5MB]
-    
-    P -->|merge into base| Q[Full model with antibody specialization]
+    N --> O[LoRA checkpoint ~4.5MB]
+    O -->|merge| P[Full model with antibody specialization]
 
-    style A fill:#e1f5fe
-    style F fill:#fff3e0
-    style G fill:#fff3e0
     style L fill:#e8f5e9
-    style P fill:#c8e6c9
-    style Q fill:#a5d6a7
+    style O fill:#c8e6c9
 ```
 
-## Prerequisites
-
-### 1. Clone and set up OpenFold3
+## Quick Start
 
 ```bash
-git clone https://github.com/aqlaboratory/openfold.git openfold-3
-cd openfold-3
-pip install -e .
-cd ..
-```
+# 1. Set up environment
+pip install torch pytorch-lightning typer pyyaml ml_collections biotite \
+    pdbeccdutils gemmi lmdb memory_profiler func_timeout requests
 
-### 2. Download pretrained model weights
-
-The OpenFold3 pretrained checkpoint (~2.2 GB) is hosted on a public AWS S3 bucket (no credentials required):
-
-```bash
+# 2. Download pretrained weights + CCD
 mkdir -p ~/.openfold3
-aws s3 cp s3://openfold3-data/openfold3-parameters/of3-p2-155k.pt \
-    ~/.openfold3/of3-p2-155k.pt --no-sign-request
+aws s3 cp s3://openfold3-data/openfold3-parameters/of3-p2-155k.pt ~/.openfold3/ --no-sign-request
+aws s3 cp s3://openfold3-data/chemical_component_dictionary.cif ~/.openfold3/ --no-sign-request
+
+# 3. Edit config.yaml with your paths (databases, checkpoint, etc.)
+
+# 4. Run the full pipeline
+PYTHONPATH="$PWD/..:$PWD/../openfold-3"
+
+# Step 1: Preprocess antibody structures
+python -m finetuning.scripts.prepare_antibody_data --config config.yaml
+
+# Step 2: Compute MSAs
+python -m finetuning.scripts.compute_msas --config config.yaml
+
+# Step 3: Train with LoRA
+python -m finetuning.scripts.train_lora --config config.yaml
 ```
 
-### 3. Download the Chemical Component Dictionary (CCD)
+## Configuration
 
-The CCD (~427 MB) is required for structure preprocessing. It defines the chemical components (amino acids, ligands, etc.) used in PDB structures:
+All settings are in **`config.yaml`**. Edit this file before running any step.
 
-```bash
-aws s3 cp s3://openfold3-data/chemical_component_dictionary.cif \
-    ~/.openfold3/chemical_component_dictionary.cif --no-sign-request
+```yaml
+# Key sections:
+paths:
+  checkpoint: ~/.openfold3/of3-p2-155k.pt
+  ccd: ~/.openfold3/chemical_component_dictionary.cif
+  data_dir: ./data/antibody_training
+
+msa:
+  method: mmseqs  # "mmseqs" | "jackhmmer" | "colabfold"
+
+lora:
+  rank: 8
+  alpha: 16.0
+  target_modules: [linear_q, linear_k, linear_v, linear_o]
+  target_blocks: [pairformer_stack]
+
+training:
+  token_budget: 256  # controls VRAM usage
+  max_epochs: 50
+  learning_rate: 5.0e-5
 ```
 
-### 4. Install Python dependencies
-
-```bash
-pip install torch pytorch-lightning ml_collections biotite pdbeccdutils \
-    gemmi lmdb memory_profiler func_timeout kalign-python click pyyaml \
-    pydantic requests boto3 awscli numpy scipy rdkit
-```
-
-## Pipeline Steps
-
-The fine-tuning pipeline consists of four stages: **data preparation**, **MSA computation**, **dataset cache creation**, and **LoRA training**.
+See the full [config.yaml](config.yaml) for all options.
 
 ---
 
+## Pipeline Steps
+
 ### Step 1: Fetch and Preprocess Antibody Structures
 
-This step downloads antibody mmCIF files from the RCSB PDB, then preprocesses them into the NPZ format that OpenFold3 expects. Preprocessing includes:
-
-- Parsing mmCIF files with biotite
-- Removing water molecules, hydrogen atoms, and crystallization aids
-- Detecting and removing inter-chain disulfide bonds
-- Adding unresolved residue segments
-- Extracting reference molecule conformers (SDF files)
-- Generating FASTA sequence files
-- Writing structure metadata cache
+Downloads antibody mmCIF files from RCSB PDB and preprocesses them into the NPZ format that OpenFold3 expects (tokenization, bond detection, conformer extraction, etc.).
 
 ```bash
-PYTHONPATH="$PWD:$PWD/openfold-3" python -m finetuning.scripts.prepare_antibody_data \
+python -m finetuning.scripts.prepare_antibody_data \
+    --config config.yaml \
     --output-dir ./data/antibody_training \
     --ccd-path ~/.openfold3/chemical_component_dictionary.cif \
-    --max-structures 100 \
-    --max-resolution 3.0 \
-    --num-workers 0
+    --max-structures 100
+```
+
+Or with a custom PDB ID list:
+
+```bash
+echo -e "7FAE\n1IGT\n6RYG" > my_antibodies.txt
+python -m finetuning.scripts.prepare_antibody_data \
+    --config config.yaml \
+    --pdb-ids-file my_antibodies.txt \
+    --skip-download  # if mmCIF files already exist
 ```
 
 **Outputs:**
@@ -111,160 +121,148 @@ data/antibody_training/
 │   ├── structure_files/{pdb_id}/     # NPZ + FASTA per structure
 │   ├── reference_mols/               # SDF conformer files
 │   └── metadata.json                 # Preprocessing metadata
-├── dataset_cache.json                # ClusteredDatasetCache for OF3
-└── pdb_ids.txt                       # List of PDB IDs used
-```
-
-> **Note:** If `--num-workers > 0`, the CCD must be loaded into each worker, which takes ~15-20 minutes for the full 427 MB file. Use `--num-workers 0` for small datasets to avoid this overhead.
-
-You can also provide an explicit list of PDB IDs instead of searching RCSB:
-
-```bash
-# Create a file with one PDB ID per line
-echo -e "7FAE\n1IGT\n6RYG" > my_antibodies.txt
-
-PYTHONPATH="$PWD:$PWD/openfold-3" python -m finetuning.scripts.prepare_antibody_data \
-    --output-dir ./data/antibody_training \
-    --ccd-path ~/.openfold3/chemical_component_dictionary.cif \
-    --pdb-ids-file my_antibodies.txt \
-    --num-workers 0 \
-    --skip-download   # if mmCIF files are already in raw_cif/
+└── dataset_cache.json                # ClusteredDatasetCache for OF3
 ```
 
 ---
 
-### Step 2: Compute MSAs via ColabFold
+### Step 2: Compute MSAs
 
-Multiple Sequence Alignments (MSAs) provide evolutionary context that is critical for structure prediction. This step queries the free [ColabFold MSA server](https://api.colabfold.com) to generate MSAs for each protein chain:
+Computes Multiple Sequence Alignments for each protein chain. Three methods are available:
 
-```bash
-PYTHONPATH="$PWD:$PWD/openfold-3" python -m finetuning.scripts.compute_msas \
-    --data-dir ./data/antibody_training \
-    --user-agent "openfold3-antibody-lora"
+| Method | Speed | Quality | Requirements |
+|--------|-------|---------|-------------|
+| **mmseqs** | Fast (~5s/query) | Good | Local MMseqs2 + sequence DB |
+| **jackhmmer** | Slow (~minutes/query) | Best | Local HMMER + FASTA DBs |
+| **colabfold** | Medium (~30s/query) | Good | Internet connection only |
+
+Set the method in `config.yaml`:
+
+```yaml
+msa:
+  method: mmseqs  # or "jackhmmer" or "colabfold"
 ```
 
-**What it does:**
-1. Reads FASTA sequences from preprocessed structures
-2. Queries ColabFold API (`https://api.colabfold.com`) for each unique protein sequence
-3. Downloads MSA results in a3m format
-4. Deduplicates identical sequences across chains (reuses MSAs)
-5. Fixes sequence length mismatches (ColabFold sometimes returns MSAs with off-by-one lengths)
-6. Saves MSA files as `colabfold_main.a3m` (filename must match OpenFold3's `max_seq_counts` filter)
+Then run:
+
+```bash
+python -m finetuning.scripts.compute_msas --config config.yaml
+```
+
+#### MMseqs2 (recommended for clusters with local databases)
+
+Requires MMseqs2 binary and a sequence database (e.g., SwissProt, UniRef90):
+
+```yaml
+msa:
+  method: mmseqs
+  mmseqs:
+    binary_path: /path/to/mmseqs
+    n_cpu: 8
+    sensitivity: 7.5
+    databases:
+      swissprot:
+        path: /data/databases/mmseqs_db/swissprot
+        output_name: uniref90_hits  # must match OF3's max_seq_counts keys
+```
+
+#### Jackhmmer (highest sensitivity)
+
+Requires HMMER3 and FASTA-format databases:
+
+```yaml
+msa:
+  method: jackhmmer
+  jackhmmer:
+    binary_path: /usr/bin/jackhmmer
+    n_cpu: 8
+    databases:
+      uniref90:
+        path: /data/databases/uniref90/uniref90.fasta
+      mgnify:
+        path: /data/databases/mgnify/mgy_clusters.fa
+      uniprot:
+        path: /data/databases/uniprot/uniprot.fasta
+```
+
+#### ColabFold (no local databases needed)
+
+Uses the free ColabFold API. No setup required, but rate-limited:
+
+```yaml
+msa:
+  method: colabfold
+```
+
+> **Important:** OpenFold3 filters MSA files by filename. Output files must be named to match keys in OF3's `max_seq_counts` (e.g., `uniref90_hits`, `colabfold_main`). The `output_name` config field handles this mapping.
 
 **Outputs:**
 ```
 data/antibody_training/
-├── msas/{pdb_id}/                    # Raw a3m files per chain
-└── alignments/{pdb_id}_{chain_id}/   # Renamed for OF3 compatibility
-    └── colabfold_main.a3m            # Must be named colabfold_main.a3m
+└── alignments/{pdb_id}_{chain_id}/
+    └── uniref90_hits.a3m    # or colabfold_main.a3m, etc.
 ```
 
-> **Important:** OpenFold3 filters MSA files by filename. The file MUST be named `colabfold_main.a3m` (not `main.a3m` or anything else), otherwise the MSA is silently discarded and training fails with empty alignments.
-
-> **Rate limiting:** The script pauses every 5 queries to respect the free ColabFold API. For 100 antibodies with ~2 unique chains each, expect ~30 minutes.
-
 ---
 
-### Step 3: Dataset Cache
-
-The `prepare_antibody_data.py` script automatically creates a `dataset_cache.json` in the `ClusteredDatasetCache` format that OpenFold3's `WeightedPDBDataset` expects. This cache contains:
-
-- Per-structure metadata: chains, resolution, release date
-- Per-chain metadata: molecule type, alignment representative ID, cluster info
-- Interface definitions (pairs of protein chains)
-- Reference molecule metadata
-
-Key details:
-- **`alignment_representative_id`** must be `"{pdb_id}_{chain_id}"` and match the directory name under `alignments/`
-- Non-protein chains (ligands, ions) must have `alignment_representative_id: null`
-- Each chain needs `cluster_id` and `cluster_size` for the weighted sampling
-
----
-
-### Step 4: LoRA Training
+### Step 3: LoRA Training
 
 ```bash
-PYTHONPATH="$PWD:$PWD/openfold-3" python -m finetuning.scripts.train_lora \
-    --dataset-cache ./data/antibody_training/dataset_cache.json \
-    --structure-dir ./data/antibody_training/preprocessed/structure_files \
-    --reference-mol-dir ./data/antibody_training/preprocessed/reference_mols \
-    --alignment-dir ./data/antibody_training/alignments \
-    --checkpoint ~/.openfold3/of3-p2-155k.pt \
-    --output-dir ./output/lora_antibody \
-    --max-epochs 10 \
-    --token-budget 48 \
-    --lr 5e-5
+python -m finetuning.scripts.train_lora --config config.yaml
 ```
 
-#### How LoRA works in this pipeline
+All parameters can be overridden via CLI:
+
+```bash
+python -m finetuning.scripts.train_lora \
+    --config config.yaml \
+    --token-budget 128 \
+    --max-epochs 20 \
+    --lr 1e-4 \
+    --devices 2
+```
+
+#### How LoRA works
 
 ```mermaid
 graph LR
     subgraph "OpenFold3 Architecture"
-        A[Input Embedder] --> B[MSA Module 4 blocks]
-        B --> C[PairFormer 48 blocks]
-        C --> D[Diffusion Module 24 blocks]
-        D --> E[Auxiliary Heads]
+        A[Input Embedder] --> B[MSA Module<br/>4 blocks]
+        B --> C[PairFormer<br/>48 blocks]
+        C --> D[Diffusion Module<br/>24 blocks]
+        D --> E[Aux Heads]
     end
-    
-    subgraph "LoRA Targets"
-        C -.->|linear_q| F[LoRA A + LoRA B]
-        C -.->|linear_k| G[LoRA A + LoRA B]
-        C -.->|linear_v| H[LoRA A + LoRA B]
-        C -.->|linear_o| I[LoRA A + LoRA B]
+
+    subgraph "LoRA adapters"
+        C -.->|Q,K,V,O| F["lora_A x lora_B<br/>rank=8"]
     end
 
     style C fill:#e8f5e9,stroke:#2e7d32
     style F fill:#c8e6c9
-    style G fill:#c8e6c9
-    style H fill:#c8e6c9
-    style I fill:#c8e6c9
 ```
 
-1. **Load pretrained model** (368M parameters)
-2. **Apply LoRA** to attention projection layers (`linear_q`, `linear_k`, `linear_v`, `linear_o`) in all 48 PairFormer blocks, adding 624 LoRA adapter pairs
-3. **Freeze all base parameters** - only LoRA parameters are trainable (2.1M params, 0.57% of total)
-4. **LoRA initialization**: `lora_A` with Kaiming uniform, `lora_B` with zeros, so the adapter starts as identity (zero delta)
-5. **Forward pass** through the full model using OpenFold3's native pipeline
-6. **Loss computation** using OpenFold3's loss module (diffusion loss + confidence loss + distogram loss)
-7. **Backward pass** - gradients flow only through LoRA parameters
-8. **EMA** tracking of LoRA parameters for stable validation
+1. Load pretrained OpenFold3 (368M parameters)
+2. Apply LoRA to attention projections in all 48 PairFormer blocks (624 adapter pairs)
+3. Freeze all base parameters — only 2.1M LoRA params are trainable (0.57%)
+4. Train with OpenFold3's native loss (diffusion + confidence + distogram)
+5. Save LoRA-only checkpoint (~4.5 MB)
 
-#### Training hyperparameters
+#### Token budget and VRAM
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--lora-rank` | 8 | Rank of LoRA decomposition. Higher = more capacity but more parameters |
-| `--lora-alpha` | 16.0 | Scaling factor. Effective scaling = alpha/rank |
-| `--lr` | 5e-5 | Learning rate for AdamW optimizer |
-| `--token-budget` | 48 | Max tokens per crop. **Critical for memory** |
-| `--max-epochs` | 10 | Number of training epochs |
+| Token Budget | ~VRAM | Recommended GPU |
+|-------------|-------|-----------------|
+| 48 | ~14 GB | RTX 3090/4090 |
+| 128 | ~28 GB | A100 40GB |
+| 256 | ~50 GB | A100 80GB |
+| 384 | ~70 GB | H100 80GB |
 
-#### Token budget and memory
-
-The `--token-budget` controls how many residue tokens are used per training sample. This is the main lever for controlling GPU memory usage:
-
-| Token Budget | ~VRAM Usage | Notes |
-|-------------|-------------|-------|
-| 32 | ~8 GB | Very small crops, fast but limited context |
-| 48 | ~14 GB | Minimum for meaningful training |
-| 128 | ~28 GB | Good balance for A100/H100 |
-| 256 | ~50 GB | Requires A100 80GB |
-| 384 | ~70 GB | Requires H100 80GB |
-| 640 | ~140 GB | Multi-GPU or model parallelism needed |
-
-> **For SLURM clusters with A100/H100 GPUs**, use `--token-budget 256` or higher. The model needs larger crops to learn meaningful structural patterns. Token budget 48 is only for testing on consumer GPUs.
-
-#### Output
-
+**Outputs:**
 ```
 output/lora_antibody/
 ├── checkpoints/
-│   ├── last.ckpt              # Full Lightning checkpoint
-│   └── epoch=X-step=Y.ckpt   # Periodic checkpoints
-├── lora_final.pt              # LoRA-only weights (~4.5 MB)
+│   └── last.ckpt
+├── lora_final.pt        # LoRA-only weights (~4.5 MB)
 └── lightning_logs/
-    └── version_0/metrics.csv  # Training metrics
 ```
 
 ---
@@ -279,96 +277,71 @@ output/lora_antibody/
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/foldfit_%j.out
 
 module load cuda/12.1
+export PYTHONPATH="$PWD/..:$PWD/../openfold-3"
 
-export PYTHONPATH="$PWD:$PWD/openfold-3"
+# Step 1: Preprocess (run once)
+python -m finetuning.scripts.prepare_antibody_data --config config.yaml
 
-# Step 1: Preprocess (only needed once)
-python -m finetuning.scripts.prepare_antibody_data \
-    --output-dir ./data/antibody_training \
-    --ccd-path ~/.openfold3/chemical_component_dictionary.cif \
-    --max-structures 500 \
-    --max-resolution 3.0 \
-    --num-workers 0
+# Step 2: MSAs (run once)
+python -m finetuning.scripts.compute_msas --config config.yaml
 
-# Step 2: Compute MSAs (only needed once)
-python -m finetuning.scripts.compute_msas \
-    --data-dir ./data/antibody_training
-
-# Step 3: Train with LoRA
-python -m finetuning.scripts.train_lora \
-    --dataset-cache ./data/antibody_training/dataset_cache.json \
-    --structure-dir ./data/antibody_training/preprocessed/structure_files \
-    --reference-mol-dir ./data/antibody_training/preprocessed/reference_mols \
-    --alignment-dir ./data/antibody_training/alignments \
-    --checkpoint ~/.openfold3/of3-p2-155k.pt \
-    --output-dir ./output/lora_antibody \
-    --max-epochs 50 \
-    --token-budget 256 \
-    --lr 5e-5 \
-    --lora-rank 8
+# Step 3: Train
+python -m finetuning.scripts.train_lora --config config.yaml --token-budget 256
 ```
+
+---
 
 ## Merging LoRA Weights
 
-After training, you can merge the LoRA weights back into the base model to produce a full checkpoint that doesn't require the LoRA code at inference time:
+After training, merge LoRA weights back into the base model for inference without the LoRA code:
 
 ```python
 from finetuning.lora.applicator import LoRAApplicator
 from finetuning.lora.checkpoint import LoRACheckpointManager
 from finetuning.lora.config import LoRAConfig
 
-# 1. Build model and apply LoRA
 model = OpenFold3(model_config)
 model.load_state_dict(base_weights)
 
 config = LoRAConfig(rank=8, alpha=16.0, ...)
 LoRAApplicator(config).apply(model)
-
-# 2. Load trained LoRA weights
 LoRACheckpointManager.load_lora_weights(model, "output/lora_antibody/lora_final.pt")
-
-# 3. Merge into base model and save
 LoRACheckpointManager.merge_and_save(model, "merged_antibody_model.pt")
 ```
 
 ## Unit Tests
 
-The core LoRA module has 57 unit tests that can run without GPU or OpenFold3:
-
 ```bash
-PYTHONPATH="$PWD" python -m pytest finetuning/tests/ -v
+PYTHONPATH="$PWD/.." python -m pytest tests/ -v  # 57 tests, no GPU needed
 ```
 
 ## Project Structure
 
 ```
 finetuning/
+├── config.yaml              # Central configuration (paths, MSA, LoRA, training)
+├── scripts/
+│   ├── prepare_antibody_data.py  # Step 1: preprocess PDB structures
+│   ├── compute_msas.py           # Step 2: MSAs (mmseqs/jackhmmer/colabfold)
+│   └── train_lora.py             # Step 3: LoRA training
 ├── lora/                    # Core LoRA implementation
 │   ├── config.py            # LoRAConfig dataclass
-│   ├── layers.py            # LoRALinear wrapper module
-│   ├── applicator.py        # Applies LoRA to model via module tree traversal
-│   └── checkpoint.py        # Save/load/merge LoRA-only weights
-├── runner/                  # Training infrastructure
+│   ├── layers.py            # LoRALinear wrapper
+│   ├── applicator.py        # Apply LoRA to model
+│   └── checkpoint.py        # Save/load/merge LoRA weights
+├── runner/
 │   ├── lora_runner.py       # PyTorch Lightning module
-│   └── lora_ema.py          # EMA tracking only LoRA parameters
-├── scripts/                 # End-to-end pipeline scripts
-│   ├── prepare_antibody_data.py  # Preprocessing pipeline
-│   ├── compute_msas.py           # ColabFold MSA computation
-│   └── train_lora.py             # Training script
+│   └── lora_ema.py          # EMA for LoRA params only
 ├── data/                    # Data utilities
-│   ├── antibody_fetcher.py  # RCSB PDB search and download
-│   ├── cdr_annotator.py     # CDR region annotation
-│   └── filters.py           # Structure filtering strategies
-├── evaluation/              # Evaluation metrics
-│   ├── metrics.py           # RMSD, dRMSD, CDR-RMSD, interface contacts
+│   ├── antibody_fetcher.py  # RCSB PDB search/download
+│   ├── cdr_annotator.py     # CDR annotation (IMGT/Chothia/Kabat)
+│   └── filters.py           # Structure filtering
+├── evaluation/
+│   ├── metrics.py           # RMSD, CDR-RMSD, dRMSD
 │   └── evaluate.py          # Evaluation entry point
-├── config/                  # Configuration
-│   ├── finetune_config.py   # Pydantic config schema
-│   └── default_antibody.yml # Default training config
-├── cli.py                   # Click CLI entry point
+├── cli.py                   # Typer CLI (train, merge, fetch-data)
 └── tests/                   # 57 unit tests
 ```
 
@@ -376,10 +349,9 @@ finetuning/
 
 | Issue | Solution |
 |-------|----------|
-| `ModuleNotFoundError: No module named 'openfold3'` | Set `PYTHONPATH="$PWD:$PWD/openfold-3"` |
-| OOM during training | Reduce `--token-budget` (try 48 for 16GB, 128 for 40GB, 256 for 80GB) |
-| MSA files silently ignored | Ensure MSA files are named `colabfold_main.a3m`, not `main.a3m` |
-| `IndexError: list index out of range` in MSA parsing | Check a3m files have consistent sequence lengths after removing lowercase insertions |
-| `KeyError: 'ClusteredDatasetCache'` | Regenerate dataset cache with `_type: ClusteredDatasetCache` |
+| `ModuleNotFoundError: No module named 'finetuning'` | Set `PYTHONPATH` to include the parent directory |
+| OOM during training | Reduce `token_budget` in config.yaml |
+| MSA files silently ignored by OF3 | Check `output_name` in config matches OF3's `max_seq_counts` keys |
+| Empty MSA / `list index out of range` | Verify alignment files exist and have consistent sequence lengths |
 | CUTLASS warnings | Install `nvidia-cutlass` or ignore (training works without it) |
-| Permutation alignment errors | These are caught and handled by fallback; training continues |
+| Permutation alignment errors | Caught by fallback; training continues normally |
