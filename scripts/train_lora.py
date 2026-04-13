@@ -214,11 +214,25 @@ def main(dataset_cache, structure_dir, reference_mol_dir, alignment_dir,
     )
     logger.info(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    from openfold3.core.utils.tensor_utils import dict_multimap
+    # Keys that should NOT get batch dim added
+    SKIP_BATCH_DIM = {"loss_weights", "ref_space_uid_to_perm"}
+
     def collate_fn(batch_list):
-        """Collate single sample into batched form."""
+        """Collate single sample into batched form by adding batch dim."""
         batch = batch_list[0]
-        return dict_multimap(lambda t: t.unsqueeze(0) if isinstance(t, torch.Tensor) else t, batch)
+        def add_batch_dim(d, skip_children=False):
+            out = {}
+            for k, v in d.items():
+                if k in SKIP_BATCH_DIM or skip_children:
+                    out[k] = v
+                elif isinstance(v, torch.Tensor) and v.ndim > 0:
+                    out[k] = v.unsqueeze(0)
+                elif isinstance(v, dict) and all(isinstance(kk, str) for kk in v.keys()):
+                    out[k] = add_batch_dim(v)
+                else:
+                    out[k] = v
+            return out
+        return add_batch_dim(batch)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=0)
