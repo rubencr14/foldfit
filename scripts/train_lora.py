@@ -9,21 +9,41 @@ Usage:
         --dataset-cache ./data/antibody_training/dataset_cache.json \
         --structure-dir ./data/antibody_training/preprocessed/structure_files \
         --reference-mol-dir ./data/antibody_training/preprocessed/reference_mols \
-        --alignment-dir ./data/antibody_training/alignment_arrays \
+        --alignment-dir ./data/antibody_training/alignments \
         --checkpoint ~/.openfold3/of3-p2-155k.pt \
         --output-dir ./output/lora_antibody
 """
 
 import gc
 import logging
-import sys
+from dataclasses import asdict
 from pathlib import Path
+from typing import Annotated, Optional
 
-import click
 import pytorch_lightning as pl
 import torch
+import torch.utils.data
+import typer
+
+from openfold3.core.data.framework.single_datasets.abstract_single import (
+    DATASET_REGISTRY,
+)
+from openfold3.core.loss.loss_module import OpenFold3Loss
+from openfold3.projects.of3_all_atom.config.dataset_configs import (
+    DatasetConfigRegistry,
+    TrainingDatasetPaths,
+)
+from openfold3.projects.of3_all_atom.config.model_config import model_config
+from openfold3.projects.of3_all_atom.model import OpenFold3
+
+from finetuning.lora.applicator import LoRAApplicator
+from finetuning.lora.checkpoint import LoRACheckpointManager
+from finetuning.lora.config import LoRAConfig
+from finetuning.runner.lora_ema import LoRAExponentialMovingAverage
 
 logger = logging.getLogger(__name__)
+
+SKIP_BATCH_DIM = {"loss_weights", "ref_space_uid_to_perm"}
 
 
 def build_of3_dataset(
@@ -34,14 +54,6 @@ def build_of3_dataset(
     token_budget: int,
 ):
     """Build a WeightedPDBDataset using OF3's native config system."""
-    from openfold3.core.data.framework.single_datasets.abstract_single import (
-        DATASET_REGISTRY,
-    )
-    from openfold3.projects.of3_all_atom.config.dataset_configs import (
-        DatasetConfigRegistry,
-        TrainingDatasetPaths,
-    )
-
     WeightedPDBConfig = DatasetConfigRegistry.get("WeightedPDBDataset")
 
     paths = TrainingDatasetPaths(
@@ -71,26 +83,43 @@ def build_of3_dataset(
     )
 
     dataset = DATASET_REGISTRY["WeightedPDBDataset"](config)
-
     logger.info(f"OF3 Dataset: {len(dataset)} samples")
     return dataset
+
+
+def collate_fn(batch_list: list[dict]) -> dict:
+    """Collate single sample into batched form by adding batch dim.
+
+    Skips loss_weights (scalars) and ref_space_uid_to_perm (int-keyed dict).
+    """
+    batch = batch_list[0]
+
+    def add_batch_dim(d: dict, skip_children: bool = False) -> dict:
+        out = {}
+        for k, v in d.items():
+            if k in SKIP_BATCH_DIM or skip_children:
+                out[k] = v
+            elif isinstance(v, torch.Tensor) and v.ndim > 0:
+                out[k] = v.unsqueeze(0)
+            elif isinstance(v, dict) and all(isinstance(kk, str) for kk in v.keys()):
+                out[k] = add_batch_dim(v)
+            else:
+                out[k] = v
+        return out
+
+    return add_batch_dim(batch)
 
 
 class LoRATrainingModule(pl.LightningModule):
     """Lightning module for LoRA training with OpenFold3."""
 
-    def __init__(self, model, model_config, lora_config, lr=5e-5, warmup=50):
+    def __init__(self, model, model_cfg, lora_config, lr=5e-5, warmup=50):
         super().__init__()
         self.model = model
         self.lora_config = lora_config
         self.lr = lr
         self.warmup = warmup
-
-        from openfold3.core.loss.loss_module import OpenFold3Loss
-        from finetuning.lora.applicator import LoRAApplicator
-        from finetuning.runner.lora_ema import LoRAExponentialMovingAverage
-
-        self.loss_fn = OpenFold3Loss(config=model_config.architecture.loss_module)
+        self.loss_fn = OpenFold3Loss(config=model_cfg.architecture.loss_module)
         self.lora_ema = LoRAExponentialMovingAverage(model, decay=0.999)
         self._applicator = LoRAApplicator(lora_config)
 
@@ -147,28 +176,28 @@ class LoRATrainingModule(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
     def on_save_checkpoint(self, checkpoint):
-        from dataclasses import asdict
-        from finetuning.lora.checkpoint import LoRACheckpointManager
         checkpoint["lora_state_dict"] = LoRACheckpointManager.extract_lora_state_dict(self.model)
         checkpoint["lora_config"] = asdict(self.lora_config)
 
 
-@click.command()
-@click.option("--dataset-cache", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--structure-dir", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--reference-mol-dir", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--alignment-dir", type=click.Path(exists=True, path_type=Path), default=None)
-@click.option("--checkpoint", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--output-dir", type=click.Path(path_type=Path), default=Path("./output/lora_antibody"))
-@click.option("--max-epochs", type=int, default=5)
-@click.option("--lr", type=float, default=5e-5)
-@click.option("--lora-rank", type=int, default=8)
-@click.option("--lora-alpha", type=float, default=16.0)
-@click.option("--token-budget", type=int, default=128)
-@click.option("--devices", type=int, default=1)
-def main(dataset_cache, structure_dir, reference_mol_dir, alignment_dir,
-         checkpoint, output_dir, max_epochs, lr, lora_rank, lora_alpha,
-         token_budget, devices):
+app = typer.Typer()
+
+
+@app.command()
+def main(
+    dataset_cache: Annotated[Path, typer.Option(help="Path to dataset_cache.json")],
+    structure_dir: Annotated[Path, typer.Option(help="Path to preprocessed structure_files/")],
+    reference_mol_dir: Annotated[Path, typer.Option(help="Path to reference_mols/")],
+    checkpoint: Annotated[Path, typer.Option(help="Path to pretrained OF3 checkpoint")],
+    alignment_dir: Annotated[Optional[Path], typer.Option(help="Path to alignments/")] = None,
+    output_dir: Annotated[Path, typer.Option(help="Output directory")] = Path("./output/lora_antibody"),
+    max_epochs: Annotated[int, typer.Option(help="Number of training epochs")] = 5,
+    lr: Annotated[float, typer.Option(help="Learning rate")] = 5e-5,
+    lora_rank: Annotated[int, typer.Option(help="LoRA rank")] = 8,
+    lora_alpha: Annotated[float, typer.Option(help="LoRA alpha")] = 16.0,
+    token_budget: Annotated[int, typer.Option(help="Max tokens per crop")] = 128,
+    devices: Annotated[int, typer.Option(help="Number of GPUs")] = 1,
+):
     """Run LoRA fine-tuning on real antibody structures."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -176,22 +205,20 @@ def main(dataset_cache, structure_dir, reference_mol_dir, alignment_dir,
     torch.set_float32_matmul_precision("medium")
 
     # 1. Build model + LoRA
-    from openfold3.projects.of3_all_atom.config.model_config import model_config
-    from openfold3.projects.of3_all_atom.model import OpenFold3
-    from finetuning.lora.applicator import LoRAApplicator
-    from finetuning.lora.config import LoRAConfig
-
     logger.info("Building model...")
     model = OpenFold3(model_config)
     logger.info(f"Loading weights from {checkpoint}")
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     cleaned = {k.removeprefix("model."): v for k, v in ckpt.items()}
     model.load_state_dict(cleaned, strict=False)
-    del ckpt; gc.collect()
+    del ckpt
+    gc.collect()
 
-    lora_config = LoRAConfig(rank=lora_rank, alpha=lora_alpha, dropout=0.05,
-                              target_modules=["linear_q", "linear_k", "linear_v", "linear_o"],
-                              target_blocks=["pairformer_stack"])
+    lora_config = LoRAConfig(
+        rank=lora_rank, alpha=lora_alpha, dropout=0.05,
+        target_modules=["linear_q", "linear_k", "linear_v", "linear_o"],
+        target_blocks=["pairformer_stack"],
+    )
     applicator = LoRAApplicator(lora_config)
     n = applicator.apply(model)
     applicator.freeze_base_parameters(model)
@@ -210,29 +237,9 @@ def main(dataset_cache, structure_dir, reference_mol_dir, alignment_dir,
     n_val = max(1, len(dataset) // 5)
     train_ds, val_ds = torch.utils.data.random_split(
         dataset, [len(dataset) - n_val, n_val],
-        generator=torch.Generator().manual_seed(42)
+        generator=torch.Generator().manual_seed(42),
     )
     logger.info(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
-
-    # Keys that should NOT get batch dim added
-    SKIP_BATCH_DIM = {"loss_weights", "ref_space_uid_to_perm"}
-
-    def collate_fn(batch_list):
-        """Collate single sample into batched form by adding batch dim."""
-        batch = batch_list[0]
-        def add_batch_dim(d, skip_children=False):
-            out = {}
-            for k, v in d.items():
-                if k in SKIP_BATCH_DIM or skip_children:
-                    out[k] = v
-                elif isinstance(v, torch.Tensor) and v.ndim > 0:
-                    out[k] = v.unsqueeze(0)
-                elif isinstance(v, dict) and all(isinstance(kk, str) for kk in v.keys()):
-                    out[k] = add_batch_dim(v)
-                else:
-                    out[k] = v
-            return out
-        return add_batch_dim(batch)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=0)
@@ -254,11 +261,10 @@ def main(dataset_cache, structure_dir, reference_mol_dir, alignment_dir,
     logger.info("Starting training...")
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    from finetuning.lora.checkpoint import LoRACheckpointManager
     final_path = output_dir / "lora_final.pt"
     LoRACheckpointManager.save_lora_weights(model, final_path, lora_config)
     logger.info(f"Done! LoRA weights: {final_path}")
 
 
 if __name__ == "__main__":
-    main()
+    app()
