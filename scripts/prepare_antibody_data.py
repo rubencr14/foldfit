@@ -138,8 +138,8 @@ def step_2_preprocess(paths: AntibodyDataPaths, ccd_path: Path, num_workers: int
     if paths.metadata_cache_path.exists():
         logger.info(f"Metadata cache: {paths.metadata_cache_path}")
     else:
-        # The metadata cache might be named differently
-        cache_files = list(paths.preprocessed_dir.glob("*cache*.json"))
+        # The metadata cache might be named differently (e.g. metadata.json)
+        cache_files = list(paths.preprocessed_dir.glob("metadata*.json"))
         if cache_files:
             paths.metadata_cache_path = cache_files[0]
             logger.info(f"Found metadata cache: {paths.metadata_cache_path}")
@@ -177,74 +177,68 @@ def _create_simple_dataset_cache(
     This builds the cache in the format expected by OpenFold3's
     DatasetCache, filtering by resolution.
     """
-    from openfold3.core.data.io.dataset_cache import _read_datacache_file
+    import json
 
-    metadata_cache = _read_datacache_file(metadata_cache_path)
+    with open(metadata_cache_path) as f:
+        metadata = json.load(f)
 
-    # Build a training-compatible dataset cache
-    # We reuse the preprocessing cache structure and add required fields
-    from openfold3.core.data.primitives.caches.format import (
-        DatasetCache,
-        DatasetChainData,
-        DatasetReferenceMoleculeData,
-        DatasetStructureData,
-    )
+    structure_data = metadata.get("structure_data", {})
+    ref_mol_data = metadata.get("reference_molecule_data", {})
 
-    structure_data = {}
+    # Build a simplified dataset cache compatible with WeightedPDBDataset
+    dataset_cache = {
+        "_type": "DatasetCache",
+        "name": "antibody-lora-training",
+        "structure_data": {},
+        "reference_molecule_data": {},
+    }
+
     skipped = 0
     included = 0
 
-    for pdb_id, entry in metadata_cache.structure_data.items():
-        # Filter by resolution
-        resolution = getattr(entry, "resolution", None)
-        if resolution is not None and resolution > max_resolution:
-            skipped += 1
-            continue
-
-        # Filter by status
-        status = getattr(entry, "status", "")
+    for pdb_id, entry in structure_data.items():
+        status = entry.get("status", "")
         if "skipped" in str(status).lower():
             skipped += 1
             continue
 
-        # Build chain data
-        chains = {}
-        for chain_id, chain_entry in getattr(entry, "chains", {}).items():
-            chains[chain_id] = DatasetChainData(
-                molecule_type=getattr(chain_entry, "molecule_type", None),
-                sequence=getattr(chain_entry, "sequence", ""),
-                alignment_representative_id=None,
-                template_ids=[],
-            )
+        resolution = entry.get("resolution")
+        if resolution is not None and resolution > max_resolution:
+            skipped += 1
+            continue
 
-        structure_data[pdb_id] = DatasetStructureData(
-            chains=chains,
-            resolution=resolution,
-            preferred_chains=getattr(entry, "preferred_chains", None),
-            preferred_interfaces=getattr(entry, "preferred_interfaces", None),
-            cluster_id=None,
-            cluster_size=1,
-        )
+        # Build chain data from preprocessing metadata
+        chains = {}
+        for chain_id, chain_info in entry.get("chains", {}).items():
+            chains[chain_id] = {
+                "molecule_type": chain_info.get("molecule_type"),
+                "sequence": chain_info.get("sequence", ""),
+                "alignment_representative_id": None,
+                "template_ids": [],
+            }
+
+        # Get preferred chains/interfaces
+        preferred_chains = entry.get("preferred_chains")
+        preferred_interfaces = entry.get("preferred_interfaces")
+
+        dataset_cache["structure_data"][pdb_id] = {
+            "chains": chains,
+            "resolution": resolution,
+            "preferred_chains": preferred_chains,
+            "preferred_interfaces": preferred_interfaces,
+            "cluster_id": None,
+            "cluster_size": 1,
+        }
         included += 1
 
     # Reference molecule data
-    ref_mol_data = {}
-    if hasattr(metadata_cache, "reference_molecule_data"):
-        for mol_id, mol_entry in metadata_cache.reference_molecule_data.items():
-            ref_mol_data[mol_id] = DatasetReferenceMoleculeData(
-                set_fallback_to_nan=False,
-            )
+    for mol_id, mol_info in ref_mol_data.items():
+        dataset_cache["reference_molecule_data"][mol_id] = {
+            "set_fallback_to_nan": False,
+        }
 
-    dataset_cache = DatasetCache(
-        name="antibody-lora-training",
-        structure_data=structure_data,
-        reference_molecule_data=ref_mol_data,
-    )
-
-    # Write using the standard IO
-    from openfold3.core.data.io.dataset_cache import write_datacache_to_json
-
-    write_datacache_to_json(dataset_cache, output_path)
+    with open(output_path, "w") as f:
+        json.dump(dataset_cache, f, indent=2)
 
     logger.info(f"Dataset cache: {included} structures included, {skipped} skipped")
 
