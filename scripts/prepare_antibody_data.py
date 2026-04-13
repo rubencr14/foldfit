@@ -185,9 +185,9 @@ def _create_simple_dataset_cache(
     structure_data = metadata.get("structure_data", {})
     ref_mol_data = metadata.get("reference_molecule_data", {})
 
-    # Build a simplified dataset cache compatible with WeightedPDBDataset
+    # Build a ClusteredDatasetCache compatible with WeightedPDBDataset
     dataset_cache = {
-        "_type": "DatasetCache",
+        "_type": "ClusteredDatasetCache",
         "name": "antibody-lora-training",
         "structure_data": {},
         "reference_molecule_data": {},
@@ -207,34 +207,53 @@ def _create_simple_dataset_cache(
             skipped += 1
             continue
 
-        # Build chain data from preprocessing metadata
+        # Build chain data with cluster info (required by WeightedPDBDataset)
+        # Fields: label_asym_id, auth_asym_id, entity_id, molecule_type,
+        #         reference_mol_id, alignment_representative_id, template_ids,
+        #         cluster_id, cluster_size
         chains = {}
         for chain_id, chain_info in entry.get("chains", {}).items():
             chains[chain_id] = {
+                "label_asym_id": chain_id,
+                "auth_asym_id": chain_id,
+                "entity_id": chain_info.get("entity_id", chain_id),
                 "molecule_type": chain_info.get("molecule_type"),
-                "sequence": chain_info.get("sequence", ""),
-                "alignment_representative_id": None,
+                "reference_mol_id": None,
+                "alignment_representative_id": f"{pdb_id}_{chain_id}" if chain_info.get("molecule_type") == "PROTEIN" else None,
                 "template_ids": [],
+                "cluster_id": f"{pdb_id}_{chain_id}",
+                "cluster_size": 1,
             }
 
-        # Get preferred chains/interfaces
-        preferred_chains = entry.get("preferred_chains")
-        preferred_interfaces = entry.get("preferred_interfaces")
+        # Build interfaces (pairs of protein chains)
+        interfaces = {}
+        protein_chains = [
+            cid for cid, cd in chains.items()
+            if cd["molecule_type"] == "PROTEIN"
+        ]
+        for i, c1 in enumerate(protein_chains):
+            for c2 in protein_chains[i + 1:]:
+                iface_id = f"{c1}_{c2}"
+                interfaces[iface_id] = {
+                    "cluster_id": f"{pdb_id}_{iface_id}",
+                    "cluster_size": 1,
+                }
 
         dataset_cache["structure_data"][pdb_id] = {
             "chains": chains,
+            "interfaces": interfaces,
             "resolution": resolution,
-            "preferred_chains": preferred_chains,
-            "preferred_interfaces": preferred_interfaces,
-            "cluster_id": None,
-            "cluster_size": 1,
+            "release_date": entry.get("release_date"),
         }
         included += 1
 
-    # Reference molecule data
+    # Reference molecule data (needs all fields from DatasetReferenceMoleculeData)
     for mol_id, mol_info in ref_mol_data.items():
         dataset_cache["reference_molecule_data"][mol_id] = {
             "set_fallback_to_nan": False,
+            "conformer_gen_strategy": mol_info.get("conformer_gen_strategy", "standard"),
+            "fallback_conformer_pdb_id": mol_info.get("fallback_conformer_pdb_id"),
+            "canonical_smiles": mol_info.get("canonical_smiles", ""),
         }
 
     with open(output_path, "w") as f:
